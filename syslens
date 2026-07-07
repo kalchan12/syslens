@@ -4,135 +4,314 @@
 # A fast, modular, cross-distribution system inspector that gathers
 # comprehensive hardware, OS, and runtime information from /proc, /sys,
 # and kernel interfaces before falling back to external utilities.
+#
+# Usage: syslens [command] [options]
+#   syslens                    Show all system information
+#   syslens cpu                Show CPU information only
+#   syslens --json             Output as JSON
+#   syslens doctor             Run health diagnostics
+#   syslens watch              Live monitoring mode
+#   syslens snapshot save      Save a system snapshot
+#   syslens snapshot diff      Compare with saved snapshot
+#   syslens help               Show this help message
 
 set -uo pipefail
 IFS=$'\n\t'
 
-VERSION="0.1.0"
-export LC_ALL=C
+# ──────────────────────────────────────────────
+#  VERSION & CONFIG
+# ──────────────────────────────────────────────
 
-# Colors
+VERSION="0.1.0"
+SNAPSHOT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/syslens/snapshots"
+export LC_ALL=C
+SELF="$0"
+
+# ──────────────────────────────────────────────
+#  COLOR / FORMATTING
+# ──────────────────────────────────────────────
+
 if [[ -t 1 ]] && [[ "${NO_COLOR:-}" != "1" ]]; then
-  R="\033[1;31m"    G="\033[1;32m"    Y="\033[1;33m"
-  B="\033[1;34m"    M="\033[1;35m"    C="\033[1;36m"
-  W="\033[1;37m"    D="\033[0;37m"    NC="\033[0m"
-  BOLD="\033[1m"    UNDER="\033[4m"
+  R="\033[1;31m"    # Red
+  G="\033[1;32m"    # Green
+  Y="\033[1;33m"    # Yellow
+  B="\033[1;34m"    # Blue
+  M="\033[1;35m"    # Magenta
+  C="\033[1;36m"    # Cyan
+  W="\033[1;37m"    # White
+  D="\033[0;37m"    # Dim
+  NC="\033[0m"      # Reset
+  BOLD="\033[1m"
+  UNDER="\033[4m"
 else
   R= G= Y= B= M= C= W= D= NC= BOLD= UNDER=
 fi
 
 # Box-drawing characters
-H_LINE="─" V_LINE="│" TL="┌" TR="┐" BL="└" BR="┘"
-TEE_DN="┬" TEE_UP="┴" TEE_LT="├" TEE_RT="┤" CROSS="┼"
+H_LINE="─"
+V_LINE="│"
+TL="┌"
+TR="┐"
+BL="└"
+BR="┘"
+TEE_DN="┬"
+TEE_UP="┴"
+TEE_LT="├"
+TEE_RT="┤"
+CROSS="┼"
+
+# ──────────────────────────────────────────────
+#  HELPERS
+# ──────────────────────────────────────────────
 
 die() { printf "${R}Error:${NC} %s\n" "$*" >&2; exit 1; }
 warn() { printf "${Y}Warning:${NC} %s\n" "$*" >&2; }
 
+# Read a file, return empty string if unavailable
 safe_read() {
   local f="$1"
-  if [[ -r "$f" ]]; then <"$f" tr -d '\0' 2>/dev/null || true; fi
-}
-safe_read_line() {
-  safe_read "$1" | head -n1 | tr -d '[:space:]' || true
-}
-has_cmd() { command -v "$1" &>/dev/null; }
-
-fmt_size_bytes() {
-  local val=$1
-  if (( val >= 1099511627776 )); then printf "%.2f TiB" "$(bc -l <<< "$val / 1099511627776" 2>/dev/null || true)"
-  elif (( val >= 1073741824 )); then printf "%.2f GiB" "$(bc -l <<< "$val / 1073741824" 2>/dev/null || true)"
-  elif (( val >= 1048576 )); then printf "%.2f MiB" "$(bc -l <<< "$val / 1048576" 2>/dev/null || true)"
-  elif (( val >= 1024 )); then printf "%.2f KiB" "$(bc -l <<< "$val / 1024" 2>/dev/null || true)"
-  else printf "%d B" "$val"; fi
-}
-
-# Data store
-declare -A SYS=()
-store() { SYS["$1"]="$2"; }
-get() { echo "${SYS[$1]-}"; }
-
-# ── Collectors ──────────────────────────────────
-
-collect_machine() {
-  store "machine.hostname" "$(hostname 2>/dev/null || uname -n)"
-  if [[ -f /sys/devices/virtual/dmi/id/product_name ]]; then
-    store "machine.product" "$(safe_read_line /sys/devices/virtual/dmi/id/product_name)"
-    store "machine.vendor" "$(safe_read_line /sys/devices/virtual/dmi/id/sys_vendor)"
+  if [[ -r "$f" ]]; then
+    <"$f" tr -d '\0' 2>/dev/null || true
   fi
 }
 
+# Read first line of a file
+safe_read_line() {
+  safe_read "$1" | head -n1 | tr -d '[:space:]' || true
+}
+
+# Check if a command exists
+has_cmd() { command -v "$1" &>/dev/null; }
+
+# Convert value to human-readable size (KiB input)
+fmt_size() {
+  local val=$1
+  local unit="${2:-K}"
+  local factor=1024
+  if [[ "$unit" == "K" ]]; then
+    if (( val >= 1073741824 )); then
+      printf "%.2f TiB" "$(bc -l <<< "$val / 1099511627776" 2>/dev/null || echo "$val/1099511627776")"
+    elif (( val >= 1048576 )); then
+      printf "%.2f GiB" "$(bc -l <<< "$val / 1073741824" 2>/dev/null || echo "$val/1073741824")"
+    elif (( val >= 1024 )); then
+      printf "%.2f MiB" "$(bc -l <<< "$val / 1048576" 2>/dev/null || echo "$val/1048576")"
+    else
+      printf "%d KiB" "$val"
+    fi
+  fi
+}
+
+# Convert bytes to human
+fmt_size_bytes() {
+  local val=$1
+  if (( val >= 1099511627776 )); then
+    printf "%.2f TiB" "$(bc -l <<< "$val / 1099511627776" 2>/dev/null || true)"
+  elif (( val >= 1073741824 )); then
+    printf "%.2f GiB" "$(bc -l <<< "$val / 1073741824" 2>/dev/null || true)"
+  elif (( val >= 1048576 )); then
+    printf "%.2f MiB" "$(bc -l <<< "$val / 1048576" 2>/dev/null || true)"
+  elif (( val >= 1024 )); then
+    printf "%.2f KiB" "$(bc -l <<< "$val / 1024" 2>/dev/null || true)"
+  else
+    printf "%d B" "$val"
+  fi
+}
+
+# Print a section header for terminal output
+section() {
+  local title="$1"
+  local color="${2:-$B}"
+  local len=60
+  local pad=$(( (len - ${#title} - 2) / 2 ))
+  local left=$pad
+  local right=$(( len - ${#title} - 2 - pad ))
+  printf "\n${color}${BOLD}"
+  printf "%s" "$TL"
+  printf "%0.s${H_LINE}" $(seq 1 $left)
+  printf " %s " "$title"
+  printf "%0.s${H_LINE}" $(seq 1 $right)
+  printf "%s${NC}\n" "$TR"
+}
+
+# Print a key-value row
+kv() {
+  local key="$1" val="$2" color="${3:-$NC}"
+  printf "${D}${V_LINE}${NC} ${BOLD}%-20s${NC} ${color}%s${NC}\n" "$key:" "$val"
+}
+
+# Print a sub-header
+sub_header() {
+  local title="$1"
+  printf "${D}${V_LINE}  ${TEE_LT} %s${NC}\n" "$title"
+}
+
+# Print a section footer
+section_end() {
+  printf "${D}%s${NC}\n" "${BL}$(printf "%0.s${H_LINE}" $(seq 1 62))${BR}"
+}
+
+checked_kv() {
+  local key="$1" val="$2"
+  if [[ -z "$val" || "$val" == "unknown" || "$val" == "0" ]]; then
+    kv "$key" "${D}N/A${NC}" "$D"
+  else
+    kv "$key" "$val" "$G"
+  fi
+}
+
+# ──────────────────────────────────────────────
+#  DATA STORE
+# ──────────────────────────────────────────────
+# We use a flat associative array with dotted keys.
+# e.g. store "cpu.model" "Intel ..."
+# Arrays use: "cpu.cores.0.freq" etc., with "cpu.cores.count" for array size.
+
+declare -A SYS=()
+
+store() { SYS["$1"]="$2"; }
+get() { echo "${SYS[$1]-}"; }
+store_arr() {
+  local base="$1" count_key="${base}.count"
+  local idx=0
+  SYS["$count_key"]=$#
+  shift
+  for val in "$@"; do
+    SYS["${base}.${idx}"]="$val"
+    ((idx++)) || true
+  done
+}
+get_arr() {
+  local base="$1" count_key="${base}.count"
+  local count="${SYS[$count_key]:-0}"
+  for ((i=0; i<count; i++)); do
+    echo "${SYS[${base}.${i}]-}"
+  done
+}
+
+# ──────────────────────────────────────────────
+#  COLLECTORS
+# ──────────────────────────────────────────────
+
+# -- Machine --
+collect_machine() {
+  local hn hostid
+  hn=$(hostname 2>/dev/null || uname -n)
+  store "machine.hostname" "$hn"
+  if [[ -f /sys/devices/virtual/dmi/id/product_name ]]; then
+    store "machine.product" "$(safe_read_line /sys/devices/virtual/dmi/id/product_name)"
+    store "machine.vendor" "$(safe_read_line /sys/devices/virtual/dmi/id/sys_vendor)"
+    store "machine.family" "$(safe_read_line /sys/devices/virtual/dmi/id/product_family)"
+    store "machine.uuid" "$(safe_read_line /sys/devices/virtual/dmi/id/product_uuid)"
+  elif has_cmd dmidecode; then
+    store "machine.product" "$(sudo dmidecode -s system-product-name 2>/dev/null || echo "unknown")"
+    store "machine.vendor" "$(sudo dmidecode -s system-manufacturer 2>/dev/null || echo "unknown")"
+  fi
+  if [[ -f /sys/firmware/devicetree/base/model ]] && [[ -r /sys/firmware/devicetree/base/model ]]; then
+    store "machine.dt_model" "$(< /sys/firmware/devicetree/base/model tr -d '\0')"
+  fi
+  chk=$(hostid 2>/dev/null)
+  store "machine.hostid" "$chk"
+}
+
+# -- CPU --
 collect_cpu() {
   local cpuinfo
   cpuinfo=$(safe_read /proc/cpuinfo) || true
   if [[ -z "$cpuinfo" ]]; then
-    has_cmd lscpu && while IFS=':' read -r key val; do
-      key="${key// /_}"; key="${key,,}"; val="${val## }"
-      case "$key" in
-        model_name) store "cpu.model" "$val" ;;
-        vendor_id) store "cpu.vendor" "$val" ;;
-      esac
-    done < <(lscpu 2>/dev/null)
+    if has_cmd lscpu; then
+      while IFS=':' read -r key val; do
+        key="${key// /_}"
+        key="${key,,}"
+        val="${val## }"
+        case "$key" in
+          model_name) store "cpu.model" "$val" ;;
+          cpu_mhz) store "cpu.mhz" "$(printf "%.0f" "$val" 2>/dev/null || echo "$val")" ;;
+          cpu_max_mhz) store "cpu.max_mhz" "$(printf "%.0f" "$val" 2>/dev/null || echo "$val")" ;;
+          cpu_min_mhz) store "cpu.min_mhz" "$(printf "%.0f" "$val" 2>/dev/null || echo "$val")" ;;
+          architecture) store "cpu.arch" "$val" ;;
+          cpu_socket*) store "cpu.sockets" "$val" ;;
+          core_s*) store "cpu.cores_per_socket" "$val" ;;
+          thread_s*) store "cpu.threads_per_core" "$val" ;;
+          vendor_id) store "cpu.vendor" "$val" ;;
+          flags) store "cpu.flags" "$val" ;;
+          virtualization) store "cpu.virt" "$val" ;;
+          bogomips) store "cpu.bogomips" "$val" ;;
+        esac
+      done < <(lscpu 2>/dev/null)
+    fi
   else
     while IFS=':' read -r key val; do
+      # Trim leading/trailing whitespace from key (but preserve internal spaces)
       key="${key#"${key%%[![:space:]]*}"}"
       key="${key%"${key##*[![:space:]]}"}"
       val="${val## }"
       case "$key" in
         "model name") store "cpu.model" "$val" ;;
+        "cpu MHz"|"cpu MHz\t") store "cpu.mhz" "$(printf "%.0f" "$val" 2>/dev/null || echo "$val")" ;;
         vendor_id) store "cpu.vendor" "$val" ;;
         flags) store "cpu.flags" "$val" ;;
         "cpu cores") store "cpu.cores" "$val" ;;
+        "cache size") store "cpu.cache" "$val" ;;
+        model) store "cpu.model_id" "$val" ;;
+        stepping) store "cpu.stepping" "$val" ;;
       esac
     done <<< "$cpuinfo"
   fi
-  local cc; cc=$(grep -c "^processor" /proc/cpuinfo 2>/dev/null || echo "0")
-  store "cpu.logical" "$cc"
-  store "cpu.arch" "$(uname -m)"
-}
 
-collect_memory() {
-  local meminfo; meminfo=$(safe_read /proc/meminfo) || true
-  if [[ -n "$meminfo" ]]; then
-    while IFS=':' read -r key val; do
-      val="${val## }"; val="${val% kB}"
-      case "$key" in
-        MemTotal) store "memory.total_kb" "$val" ;;
-        MemFree) store "memory.free_kb" "$val" ;;
-        MemAvailable) store "memory.avail_kb" "$val" ;;
-        SwapTotal) store "memory.swap_total_kb" "$val" ;;
-        SwapFree) store "memory.swap_free_kb" "$val" ;;
-      esac
-    done <<< "$meminfo"
+  # Get CPU count from /proc/cpuinfo
+  local core_count
+  core_count=$(grep -c "^processor" /proc/cpuinfo 2>/dev/null || echo "0")
+  store "cpu.logical" "$core_count"
+
+  # Physical cores from topology
+  local phys=0
+  if [[ -d /sys/devices/system/cpu ]]; then
+    for dir in /sys/devices/system/cpu/cpu[0-9]*/topology/core_id; do
+      [[ -r "$dir" ]] || continue
+      phys=$((phys + 1))
+    done 2>/dev/null || true
   fi
-}
+  store "cpu.physical_total" "$phys"
 
-collect_os() {
-  if [[ -f /etc/os-release ]]; then
-    while IFS='=' read -r key val; do
-      val="${val%\"}"; val="${val#\"}"
-      case "$key" in
-        PRETTY_NAME) store "os.pretty_name" "$val" ;;
-        ID) store "os.id" "$val" ;;
-        VERSION_ID) store "os.version_id" "$val" ;;
-      esac
-    done < /etc/os-release
+  # Per-core frequencies
+  if [[ -d /sys/devices/system/cpu ]]; then
+    local idx=0
+    for cpuf in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do
+      if [[ -r "$cpuf" ]]; then
+        local freq=$(< "$cpuf")
+        freq=$((freq / 1000))
+        store "cpu.core.${idx}.freq" "$freq"
+        ((idx++)) || true
+      fi
+    done
+    store "cpu.core_count" "$idx"
   fi
-  store "os.arch" "$(uname -m)"
-  store "os.user" "$(whoami 2>/dev/null || id -un)"
+
+  # Load averages
+  local loadavg
+  loadavg=$(< /proc/loadavg) 2>/dev/null || true
+  store "cpu.load_1m" "$(echo "${loadavg:-}" | awk '{print $1}')"
+  store "cpu.load_5m" "$(echo "${loadavg:-}" | awk '{print $2}')"
+  store "cpu.load_15m" "$(echo "${loadavg:-}" | awk '{print $3}')"
 }
 
-collect_kernel() {
-  store "kernel.release" "$(uname -r)"
-  store "kernel.version" "$(uname -v)"
-  store "kernel.machine" "$(uname -m)"
-}
-
-collect_uptime() {
-  local secs; secs=$(safe_read_line /proc/uptime 2>/dev/null | awk '{print $1}' | cut -d. -f1) || true
-  if [[ -n "$secs" ]]; then
-    local d=$((secs/86400)) h=$(((secs%86400)/3600)) m=$(((secs%3600)/60)) s=$((secs%60))
-    store "uptime.seconds" "$secs"
-    store "uptime.display" "${d}d ${h}h ${m}m ${s}s"
+collect_cpu_usage() {
+  local stat prev_idle prev_total
+  stat=$(safe_read /proc/stat | head -1) || true
+  local user nice sys idle iowait irq softirq steal
+  read -r _ user nice sys idle iowait irq softirq steal <<< "$stat"
+  prev_total=$((user + nice + sys + idle + iowait + irq + softirq + steal))
+  prev_idle=$((idle + iowait))
+  sleep 0.3
+  stat=$(safe_read /proc/stat | head -1) || true
+  read -r _ user nice sys idle iowait irq softirq steal <<< "$stat"
+  local total=$((user + nice + sys + idle + iowait + irq + softirq + steal))
+  local idl=$((idle + iowait))
+  local total_d=$((total - prev_total))
+  local idle_d=$((idl - prev_idle))
+  if (( total_d > 0 )); then
+    local usage=$(( 100 * (total_d - idle_d) / total_d ))
+    store "cpu.usage_percent" "$usage"
   fi
 }
 
@@ -143,6 +322,7 @@ collect_gpu() {
     while IFS= read -r line; do
       if [[ "$line" =~ VGA|3D|Display ]]; then
         local dev ven rev
+        # lspci -mm uses quoted fields; parse accordingly
         dev=$(echo "$line" | sed -n 's/^[^"]*"\([^"]*\)".*/\1/p')
         ven=$(echo "$line" | sed -n 's/^[^"]*"[^"]*"[[:space:]]*"\([^"]*\)".*/\1/p')
         rev=$(echo "$line" | sed -n 's/.*(rev \([^)]*\)).*/\1/p')
@@ -154,6 +334,44 @@ collect_gpu() {
     done < <(lspci -mm 2>/dev/null || true)
   fi
   store "gpu.count" "$idx"
+  if [[ -d /sys/class/drm ]]; then
+    for card in /sys/class/drm/card[0-9]*; do
+      [[ -d "$card" ]] || continue
+      local cname="${card##*/}"
+      store "drm.${cname}.device" "$(safe_read_line "$card/device/device" 2>/dev/null)"
+      store "drm.${cname}.vendor" "$(safe_read_line "$card/device/vendor" 2>/dev/null)"
+      local mem
+      mem=$(safe_read_line "$card/device/mem_info_vram_total" 2>/dev/null)
+      if [[ -n "$mem" ]]; then
+        store "drm.${cname}.vram" "$((mem / 1048576))"
+      fi
+    done
+  fi
+}
+
+# -- Memory --
+collect_memory() {
+  local meminfo
+  meminfo=$(safe_read /proc/meminfo) || true
+  if [[ -n "$meminfo" ]]; then
+    while IFS=':' read -r key val; do
+      val="${val## }"
+      val="${val% kB}"
+      case "$key" in
+        MemTotal)   store "memory.total_kb" "$val" ;&
+        MemFree)    store "memory.free_kb" "$val" ;&
+        MemAvailable) store "memory.avail_kb" "$val" ;&
+        Buffers)    store "memory.buffers_kb" "$val" ;&
+        Cached)     store "memory.cached_kb" "$val" ;&
+        SwapTotal)  store "memory.swap_total_kb" "$val" ;&
+        SwapFree)   store "memory.swap_free_kb" "$val" ;&
+        Shmem)      store "memory.shared_kb" "$val" ;;
+      esac
+    done <<< "$meminfo"
+  fi
+  if has_cmd free; then
+    store "memory.human" "$(free -h 2>/dev/null | awk '/^Mem:/{print $3"/"$2}')"
+  fi
 }
 
 # -- Storage --
@@ -162,11 +380,12 @@ collect_storage() {
   if has_cmd lsblk; then
     while IFS= read -r line; do
       [[ -z "$line" ]] && continue
-      local name size type
+      local name size type mount
       name=$(echo "$line" | awk '{print $1}')
       size=$(echo "$line" | awk '{print $2}')
       type=$(echo "$line" | awk '{print $3}')
       [[ "$type" != "disk" ]] && continue
+      mount=$(echo "$line" | awk '{print $4}')
       local model
       model=$(lsblk -dln -o MODEL "/dev/$name" 2>/dev/null | head -1)
       model="${model:- }"
@@ -174,13 +393,14 @@ collect_storage() {
       store "storage.${idx}.size" "$size"
       store "storage.${idx}.model" "$model"
       ((idx++)) || true
-    done < <(lsblk -dln -o NAME,SIZE,TYPE 2>/dev/null)
+    done < <(lsblk -dln -o NAME,SIZE,TYPE,MOUNTPOINT 2>/dev/null)
     store "storage.count" "$idx"
   fi
-  # Filesystem usage
+
+  # Filesystem usage from df
   local fidx=0
   while IFS= read -r line; do
-    local fs size used avail use mount
+    local fs size used avail use mount target
     fs=$(echo "$line" | awk '{print $1}')
     size=$(echo "$line" | awk '{print $2}')
     used=$(echo "$line" | awk '{print $3}')
@@ -189,6 +409,7 @@ collect_storage() {
     mount=$(echo "$line" | awk '{print $6}')
     [[ "$fs" == "Filesystem" ]] && continue
     [[ "$fs" == "tmpfs" || "$fs" == "devtmpfs" || "$fs" == "efivarfs" ]] && continue
+    [[ -z "$mount" ]] && continue
     store "fs.${fidx}.filesystem" "$fs"
     store "fs.${fidx}.size" "$size"
     store "fs.${fidx}.used" "$used"
@@ -221,9 +442,25 @@ collect_battery() {
     store "battery.${bidx}.technology" "$(safe_read_line "$bat/technology")"
     store "battery.${bidx}.model" "$(safe_read_line "$bat/model_name")"
     store "battery.${bidx}.manufacturer" "$(safe_read_line "$bat/manufacturer")"
+
+    # Compute watt-hours
+    if [[ "$voltage_now" -gt 0 && "$energy_full" -gt 0 ]]; then
+      local wh
+      wh=$(bc -l <<< "$energy_full * $voltage_now / 1000000000000" 2>/dev/null || echo "0")
+      store "battery.${bidx}.wh_design" "$(printf "%.1f" "$wh")"
+    fi
     ((bidx++)) || true
   done
   store "battery.count" "$bidx"
+
+  # Also check AC adapter
+  local ac_idx=0
+  for ac in /sys/class/power_supply/AC[0-9]*; do
+    [[ -d "$ac" ]] || continue
+    store "ac.${ac_idx}.online" "$(safe_read_line "$ac/online")"
+    ((ac_idx++)) || true
+  done
+  store "ac.count" "$ac_idx"
 }
 
 # -- Fans --
@@ -233,8 +470,12 @@ collect_fans() {
     while IFS= read -r line; do
       if [[ "$line" =~ ([0-9]+)\ RPM ]]; then
         local rpm="${BASH_REMATCH[1]}"
+        local name="fan_${fidx}"
+        # Try to get label
         local label=""
-        [[ "$line" =~ ^([^:]+): ]] && label="${BASH_REMATCH[1]}"
+        if [[ "$line" =~ ^([^:]+): ]]; then
+          label="${BASH_REMATCH[1]}"
+        fi
         store "fan.${fidx}.name" "$label"
         store "fan.${fidx}.rpm" "$rpm"
         ((fidx++)) || true
@@ -242,11 +483,30 @@ collect_fans() {
     done < <(sensors 2>/dev/null || true)
   fi
   store "fan.count" "$fidx"
+
+  # Also check hwmon
+  if [[ -d /sys/class/hwmon ]]; then
+    for hw in /sys/class/hwmon/hwmon[0-9]*; do
+      for fan_input in "$hw"/fan[0-9]*_input; do
+        [[ -r "$fan_input" ]] || continue
+        local rpm_val
+        rpm_val="$(< "$fan_input" tr -d ' \n')"
+        local fname="${fan_input##*/}"
+        fname="${fname%_input}"
+        store "fan.hwmon.${fname}.rpm" "$rpm_val"
+        # Try label
+        local label
+        label="$(safe_read_line "${fan_input%_input}_label")"
+        store "fan.hwmon.${fname}.label" "$label"
+      done
+    done
+  fi
 }
 
 # -- Temperatures --
 collect_temps() {
   local tidx=0
+  # From thermal zones
   for zone in /sys/class/thermal/thermal_zone[0-9]*; do
     [[ -d "$zone" ]] || continue
     local temp type
@@ -260,6 +520,28 @@ collect_temps() {
       ((tidx++)) || true
     fi
   done
+
+  # From hwmon
+  if [[ -d /sys/class/hwmon ]]; then
+    for hw in /sys/class/hwmon/hwmon[0-9]*; do
+      for temp_input in "$hw"/temp[0-9]*_input; do
+        [[ -r "$temp_input" ]] || continue
+        local tval tname
+        tval="$(< "$temp_input" tr -d ' \n')"
+        tname="${temp_input##*/}"
+        tname="${tname%_input}"
+        if [[ "$tval" -gt 0 ]]; then
+          local tc
+          tc=$(bc -l <<< "$tval / 1000" 2>/dev/null || echo "0")
+          store "temp.hwmon.${tname}.celsius" "$(printf "%.1f" "$tc")"
+          local label
+          label="$(safe_read_line "${temp_input%_input}_label")"
+          store "temp.hwmon.${tname}.label" "$label"
+        fi
+      done
+    done
+  fi
+
   store "temp.count" "$tidx"
 }
 
@@ -284,10 +566,31 @@ collect_displays() {
     done < <(xrandr --current 2>/dev/null || true)
   fi
   store "display.count" "$idx"
+
+  # From /sys/class/drm as fallback
+  if [[ "$idx" -eq 0 && -d /sys/class/drm ]]; then
+    for card in /sys/class/drm/card[0-9]*/card[0-9]*-*-*; do
+      [[ -d "$card" ]] || continue
+      local edid="$card/edid"
+      if [[ -r "$edid" && -f "$edid" ]]; then
+        local man
+        man=$(hexdump -n 4 -e '4/1 "%c"' "$edid" 2>/dev/null || echo "")
+        store "display.${idx}.edid" "present"
+        store "display.${idx}.name" "${card##*/}"
+        ((idx++)) || true
+      fi
+    done
+    store "display.count" "$idx"
+  fi
+
+  # /sys/class/backlight
   for bl in /sys/class/backlight/*/brightness; do
     [[ -r "$bl" ]] || continue
-    store "display.backlight" "$(safe_read_line "$bl")"
-    store "display.max_backlight" "$(safe_read_line "${bl%/*}/max_brightness")"
+    local brightness max_brightness
+    brightness=$(safe_read_line "$bl")
+    max_brightness=$(safe_read_line "${bl%/*}/max_brightness")
+    store "display.backlight" "$brightness"
+    store "display.max_backlight" "$max_brightness"
   done
 }
 
@@ -298,6 +601,12 @@ collect_motherboard() {
     store "board.name" "$(safe_read_line /sys/devices/virtual/dmi/id/board_name)"
     store "board.version" "$(safe_read_line /sys/devices/virtual/dmi/id/board_version)"
     store "board.serial" "$(safe_read_line /sys/devices/virtual/dmi/id/board_serial)"
+    store "board.asset_tag" "$(safe_read_line /sys/devices/virtual/dmi/id/board_asset_tag)"
+  elif has_cmd dmidecode; then
+    store "board.vendor" "$(sudo dmidecode -s baseboard-manufacturer 2>/dev/null || echo "unknown")"
+    store "board.name" "$(sudo dmidecode -s baseboard-product-name 2>/dev/null || echo "unknown")"
+    store "board.version" "$(sudo dmidecode -s baseboard-version 2>/dev/null || echo "unknown")"
+    store "board.serial" "$(sudo dmidecode -s baseboard-serial-number 2>/dev/null || echo "unknown")"
   fi
 }
 
@@ -309,7 +618,13 @@ collect_bios() {
     store "bios.date" "$(safe_read_line /sys/devices/virtual/dmi/id/bios_date)"
     store "bios.release" "$(safe_read_line /sys/devices/virtual/dmi/id/bios_release)"
     store "bios.ec_firmware" "$(safe_read_line /sys/devices/virtual/dmi/id/ec_firmware_release)"
+  elif has_cmd dmidecode; then
+    store "bios.vendor" "$(sudo dmidecode -s bios-vendor 2>/dev/null || echo "unknown")"
+    store "bios.version" "$(sudo dmidecode -s bios-version 2>/dev/null || echo "unknown")"
+    store "bios.date" "$(sudo dmidecode -s bios-release-date 2>/dev/null || echo "unknown")"
   fi
+
+  # UEFI detection
   if [[ -d /sys/firmware/efi ]]; then
     store "bios.mode" "UEFI"
   else
@@ -317,46 +632,50 @@ collect_bios() {
   fi
 }
 
-collect_all() {
-  collect_machine; collect_cpu; collect_memory; collect_os; collect_kernel; collect_uptime
-  collect_gpu; collect_storage; collect_battery; collect_fans; collect_temps
-  collect_displays; collect_motherboard; collect_bios
-  collect_network; collect_audio; collect_usb; collect_pci
-  collect_security; collect_virtualization; collect_processes; collect_system_load
-  collect_cpu_load
-
 # -- Network --
 collect_network() {
   local idx=0
+  # From /sys/class/net
   for net in /sys/class/net/*; do
     [[ -d "$net" ]] || continue
     local ifname="${net##*/}"
     [[ "$ifname" == "lo" ]] && continue
     store "net.${idx}.name" "$ifname"
+    store "net.${idx}.type" "$(safe_read_line "$net/type")"
     store "net.${idx}.address" "$(safe_read_line "$net/address")"
-    local duplex speed operstate
-    duplex="$(safe_read_line "$net/duplex" 2>/dev/null || true)"
-    speed="$(safe_read_line "$net/speed" 2>/dev/null || true)"
-    operstate="$(safe_read_line "$net/operstate" 2>/dev/null || echo "unknown")"
+    local duplex speed
+    duplex="$(safe_read_line "$net/duplex" 2>/dev/null || echo "")"
+    speed="$(safe_read_line "$net/speed" 2>/dev/null || echo "")"
     store "net.${idx}.duplex" "$duplex"
     store "net.${idx}.speed" "$speed"
+    local operstate
+    operstate="$(safe_read_line "$net/operstate" 2>/dev/null || echo "unknown")"
     store "net.${idx}.state" "$operstate"
     ((idx++)) || true
   done
   store "net.count" "$idx"
-  # Traffic stats
+
+  # Network traffic from /proc/net/dev
   while IFS= read -r line; do
     if [[ "$line" =~ ^[[:space:]]*([^:]+):[[:space:]]*(.*) ]]; then
-      local dev_name="${BASH_REMATCH[1]}" stats="${BASH_REMATCH[2]}"
-      local rx tx
-      rx=$(echo "$stats" | awk '{print $1}')
-      tx=$(echo "$stats" | awk '{print $9}')
+      local dev_name="${BASH_REMATCH[1]}"
+      local stats="${BASH_REMATCH[2]}"
+      local rx_bytes tx_bytes
+      rx_bytes=$(echo "$stats" | awk '{print $1}')
+      tx_bytes=$(echo "$stats" | awk '{print $9}')
       for ((i=0; i<idx; i++)); do
-        [[ "$(get net.${i}.name)" == "$dev_name" ]] && store "net.${i}.rx_bytes" "$rx" && store "net.${i}.tx_bytes" "$tx"
+        if [[ "$(get "net.${i}.name")" == "$dev_name" ]]; then
+          store "net.${i}.rx_bytes" "$rx_bytes"
+          store "net.${i}.tx_bytes" "$tx_bytes"
+        fi
       done
     fi
   done < /proc/net/dev
-  store "net.default_gateway" "$(ip route show default 2>/dev/null | awk '{print $3}')"
+
+  # Default route info
+  local gw
+  gw=$(ip route show default 2>/dev/null | awk '{print $3}') || true
+  store "net.default_gateway" "$gw"
 }
 
 # -- Audio --
@@ -364,18 +683,38 @@ collect_audio() {
   local idx=0
   if has_cmd lspci; then
     while IFS= read -r line; do
-      if [[ "$line" =~ Audio|HDMI|HDA|AC97 ]]; then
-        local dev pci
+      if [[ "$line" =~ Audio|HDA|HDMI|AC97|S/PDIF|I82801|CA0132|CA0110|SB|ALC ]]; then
+        local dev
         dev=$(echo "$line" | sed 's/.*: //; s/ (.*//')
-        pci=$(echo "$line" | awk '{print $1}')
         store "audio.${idx}.device" "$dev"
-        store "audio.${idx}.pci" "$pci"
+        store "audio.${idx}.pci" "$(echo "$line" | awk '{print $1}')"
         ((idx++)) || true
       fi
     done < <(lspci 2>/dev/null || true)
   fi
   store "audio.count" "$idx"
-  store "audio.alsa_info" "$(safe_read /proc/asound/version 2>/dev/null | head -1)"
+
+  # ALSA devices
+  if [[ -d /proc/asound ]]; then
+    local cards
+    cards=$(safe_read /proc/asound/cards 2>/dev/null || echo "")
+    if [[ -n "$cards" ]]; then
+      store "audio.alsa_cards" "$(echo "$cards" | wc -l)"
+    fi
+    store "audio.alsa_info" "$(safe_read /proc/asound/version 2>/dev/null | head -1)"
+  fi
+
+  # PulseAudio / PipeWire
+  if has_cmd pactl; then
+    local sinks
+    sinks=$(pactl list sinks short 2>/dev/null | wc -l)
+    store "audio.pulse_sinks" "$sinks"
+  fi
+  if has_cmd pw-cli; then
+    local nodes
+    nodes=$(pw-cli list-nodes 2>/dev/null | grep -c "node.name" || echo "0")
+    store "audio.pipewire_nodes" "$nodes"
+  fi
 }
 
 # -- USB --
@@ -384,10 +723,12 @@ collect_usb() {
     local idx=0
     while IFS= read -r line; do
       if [[ "$line" =~ ^Bus ]]; then
-        local bus dev id desc
+        local bus dev id vendor product
         bus=$(echo "$line" | awk '{print $2}')
         dev=$(echo "$line" | awk '{print $4}' | tr -d ':')
         id=$(echo "$line" | awk '{print $6}')
+        # Extract vendor:product names
+        local desc
         desc=$(echo "$line" | sed 's/.*://; s/^[[:space:]]*//')
         store "usb.${idx}.bus" "$bus"
         store "usb.${idx}.device" "$dev"
@@ -405,7 +746,7 @@ collect_pci() {
   if has_cmd lspci; then
     local idx=0
     while IFS= read -r line; do
-      local slot desc
+      local slot cls ven dev rev desc
       slot=$(echo "$line" | awk '{print $1}')
       desc=$(echo "$line" | sed 's/^[^ ]* //; s/ (.*//')
       store "pci.${idx}.slot" "$slot"
@@ -416,63 +757,216 @@ collect_pci() {
   fi
 }
 
+# -- Operating System --
+collect_os() {
+  if [[ -f /etc/os-release ]]; then
+    while IFS='=' read -r key val; do
+      val="${val%\"}"
+      val="${val#\"}"
+      case "$key" in
+        ID) store "os.id" "$val" ;;
+        ID_LIKE) store "os.id_like" "$val" ;;
+        PRETTY_NAME) store "os.pretty_name" "$val" ;;
+        VERSION_ID) store "os.version_id" "$val" ;;
+        VERSION_CODENAME) store "os.codename" "$val" ;;
+        HOME_URL) store "os.home_url" "$val" ;;
+      esac
+    done < /etc/os-release
+  elif [[ -f /etc/lsb-release ]]; then
+    while IFS='=' read -r key val; do
+      case "$key" in
+        DISTRIB_ID) store "os.id" "$val" ;;
+        DISTRIB_RELEASE) store "os.version_id" "$val" ;;
+        DISTRIB_CODENAME) store "os.codename" "$val" ;;
+        DISTRIB_DESCRIPTION) store "os.pretty_name" "$val" ;;
+      esac
+    done < /etc/lsb-release
+  fi
+  store "os.hostname" "$(hostname 2>/dev/null || uname -n)"
+  store "os.arch" "$(uname -m)"
+  store "os.user" "$(whoami 2>/dev/null || id -un)"
+  local term
+  term="${TERM:-unknown}"
+  store "os.term" "$term"
+  local shell
+  shell="$(basename "${SHELL:-/bin/sh}")"
+  store "os.shell" "$shell"
+  local desktop
+  desktop="${XDG_CURRENT_DESKTOP:-${DESKTOP_SESSION:-unknown}}"
+  store "os.desktop" "$desktop"
+  # Sessions
+  local sessions
+  sessions=$(who | wc -l)
+  store "os.sessions" "$sessions"
+}
+
+# -- Kernel --
+collect_kernel() {
+  store "kernel.name" "$(uname -s)"
+  store "kernel.release" "$(uname -r)"
+  store "kernel.version" "$(uname -v)"
+  store "kernel.machine" "$(uname -m)"
+  local modules
+  modules=$(lsmod 2>/dev/null | tail -n +2 | wc -l || echo "0")
+  store "kernel.modules" "$modules"
+  # Command line
+  store "kernel.cmdline" "$(safe_read_line /proc/cmdline)"
+}
+
 # -- Security --
 collect_security() {
+  # AppArmor
   if [[ -d /sys/kernel/security/apparmor ]]; then
     store "security.apparmor" "enabled"
-    store "security.apparmor_profiles" "$(cat /sys/kernel/security/apparmor/profiles 2>/dev/null | wc -l)"
+    local profiles
+    profiles=$(cat /sys/kernel/security/apparmor/profiles 2>/dev/null | wc -l)
+    store "security.apparmor_profiles" "$profiles"
   else
     store "security.apparmor" "disabled"
   fi
-  if has_cmd getenforce; then store "security.selinux" "$(getenforce 2>/dev/null)"
-  else store "security.selinux" "not_present"; fi
+
+  # SELinux
+  if has_cmd getenforce; then
+    store "security.selinux" "$(getenforce 2>/dev/null)"
+  else
+    store "security.selinux" "not_present"
+  fi
+
+  # Firewall status
+  if has_cmd ufw; then
+    store "security.ufw" "$(ufw status 2>/dev/null | head -1)" || store "security.ufw" "unknown"
+  elif has_cmd firewall-cmd; then
+    store "security.firewalld" "$(firewall-cmd --state 2>/dev/null || echo "inactive")"
+  elif has_cmd iptables; then
+    local rules
+    rules=$(iptables -L -n 2>/dev/null | grep -c "^Chain" || echo "0")
+    store "security.iptables_rules" "$rules"
+  fi
+
+  # ASLR
   if [[ -f /proc/sys/kernel/randomize_va_space ]]; then
-    local aslr; aslr=$(safe_read_line /proc/sys/kernel/randomize_va_space)
+    local aslr
+    aslr=$(safe_read_line /proc/sys/kernel/randomize_va_space)
     case "$aslr" in
       0) store "security.aslr" "disabled" ;;
-      1) store "security.aslr" "partial" ;;
-      2) store "security.aslr" "full" ;;
+      1) store "security.aslr" "partial (randomize stack/libs)" ;;
+      2) store "security.aslr" "full (randomize heap too)" ;;
     esac
   fi
-  if [[ -f /proc/sys/kernel/yama/ptrace_scope ]]; then
-    store "security.ptrace_scope" "$(safe_read_line /proc/sys/kernel/yama/ptrace_scope)"
-  fi
-  if has_cmd ufw; then store "security.ufw" "$(ufw status 2>/dev/null | head -1)"; fi
-  local sb_file; sb_file=$(ls /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | head -1) || true
+
+  # Secure boot
+  local sb_file
+  sb_file=$(ls /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | head -1) || true
   if [[ -n "$sb_file" && -f "$sb_file" ]]; then
-    local sb; sb=$(od -An -t u1 "$sb_file" 2>/dev/null | head -1 | awk '{print $2}')
-    store "security.secure_boot" "$( [[ "$sb" == "1" ]] && echo "enabled" || echo "disabled" )"
+    local sb
+    sb=$(od -An -t u1 "$sb_file" 2>/dev/null | head -1 | awk '{print $2}')
+    if [[ "$sb" == "1" ]]; then
+      store "security.secure_boot" "enabled"
+    elif [[ "$sb" == "0" ]]; then
+      store "security.secure_boot" "disabled"
+    else
+      store "security.secure_boot" "unknown"
+    fi
   else
     store "security.secure_boot" "N/A"
+  fi
+
+  # Yama ptrace scope
+  if [[ -f /proc/sys/kernel/yama/ptrace_scope ]]; then
+    local yama
+    yama=$(safe_read_line /proc/sys/kernel/yama/ptrace_scope)
+    store "security.ptrace_scope" "$yama"
   fi
 }
 
 # -- Virtualization --
 collect_virtualization() {
   local virt=""
+  # Check for hypervisor CPU flag
+  local cpuinfo
+  cpuinfo=$(safe_read /proc/cpuinfo)
+  if echo "$cpuinfo" | grep -qi "hypervisor"; then
+    virt="hypervisor"
+  fi
+
+  # Check DMI
+  if [[ -f /sys/devices/virtual/dmi/id/product_name ]]; then
+    local prod
+    prod=$(safe_read_line /sys/devices/virtual/dmi/id/product_name)
+    case "$prod" in
+      *VMware*) virt="VMware" ;;
+      *VirtualBox*) virt="VirtualBox" ;;
+      *KVM*|*QEMU*) virt="KVM/QEMU" ;;
+      *Xen*) virt="Xen" ;;
+      *Microsoft*) virt="Hyper-V" ;;
+      *Bochs*) virt="Bochs/QEMU" ;;
+    esac
+  fi
+
+  # Check systemd
   if has_cmd systemd-detect-virt; then
-    local sdv; sdv=$(systemd-detect-virt 2>/dev/null || echo "none")
+    local sdv
+    sdv=$(systemd-detect-virt 2>/dev/null || echo "none")
     [[ "$sdv" != "none" ]] && virt="$sdv"
   fi
-  if [[ -z "$virt" && -f /sys/devices/virtual/dmi/id/product_name ]]; then
-    local prod; prod=$(safe_read_line /sys/devices/virtual/dmi/id/product_name)
-    case "$prod" in *VMware*) virt="VMware" ;; *VirtualBox*) virt="VirtualBox" ;; *KVM*|*QEMU*) virt="KVM/QEMU" ;; *Xen*) virt="Xen" ;; esac
+
+  # Container detection
+  if [[ -f /proc/1/cgroup ]]; then
+    if grep -qi "docker" /proc/1/cgroup 2>/dev/null; then
+      store "virtualization.container" "docker"
+    fi
+    if grep -qi "kubepods" /proc/1/cgroup 2>/dev/null; then
+      store "virtualization.container" "kubernetes"
+    fi
   fi
-  if [[ -z "$virt" ]]; then
-    local cpuinfo; cpuinfo=$(safe_read /proc/cpuinfo)
-    echo "$cpuinfo" | grep -qi "hypervisor" && virt="hypervisor"
-  fi
+
   store "virtualization.type" "${virt:-none}"
   store "virtualization.is_vm" "$( [[ -n "$virt" ]] && echo "yes" || echo "no" )"
 }
 
+# -- Uptime --
+collect_uptime() {
+  local uptime_secs
+  uptime_secs=$(safe_read_line /proc/uptime 2>/dev/null | awk '{print $1}' | cut -d. -f1) || true
+  if [[ -n "$uptime_secs" ]]; then
+    local days=$((uptime_secs / 86400))
+    local hours=$(( (uptime_secs % 86400) / 3600 ))
+    local mins=$(( (uptime_secs % 3600) / 60 ))
+    local secs=$(( uptime_secs % 60 ))
+    store "uptime.seconds" "$uptime_secs"
+    store "uptime.display" "${days}d ${hours}h ${mins}m ${secs}s"
+    store "uptime.days" "$days"
+    store "uptime.hours" "$hours"
+    store "uptime.minutes" "$mins"
+    store "uptime.seconds_only" "$secs"
+
+    # Boot time
+    if [[ -f /proc/stat ]]; then
+      local btime
+      btime=$(grep "^btime" /proc/stat 2>/dev/null | awk '{print $2}')
+      store "uptime.boot_time" "$btime"
+    fi
+  fi
+}
+
 # -- Processes --
 collect_processes() {
-  store "process.total" "$(ps -e 2>/dev/null | wc -l | awk '{print $1-1}')"
-  store "process.running" "$(ps -e -o state= 2>/dev/null | grep -c "^R" || echo "0")"
-  store "process.sleeping" "$(ps -e -o state= 2>/dev/null | grep -c "^S" || echo "0")"
-  store "process.zombie" "$(ps -e -o state= 2>/dev/null | grep -c "^Z" || echo "0")"
-  store "process.stopped" "$(ps -e -o state= 2>/dev/null | grep -c "^T" || echo "0")"
+  local total running sleeping zombie stopped
+  total=$(ps -e 2>/dev/null | wc -l)
+  [[ -z "$total" ]] && total=$(ls /proc/[0-9]* 2>/dev/null | wc -l || echo "0")
+  store "process.total" "$((total - 1))"
+
+  running=$(ps -e -o state= 2>/dev/null | grep -c "^R" || echo "0")
+  sleeping=$(ps -e -o state= 2>/dev/null | grep -c "^S" || echo "0")
+  zombie=$(ps -e -o state= 2>/dev/null | grep -c "^Z" || echo "0")
+  stopped=$(ps -e -o state= 2>/dev/null | grep -c "^T" || echo "0")
+
+  store "process.running" "$running"
+  store "process.sleeping" "$sleeping"
+  store "process.zombie" "$zombie"
+  store "process.stopped" "$stopped"
+
+  # Top processes by CPU
   local top_idx=0
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
@@ -491,271 +985,358 @@ collect_processes() {
   store "process.top_count" "$top_idx"
 }
 
-# -- System load --
+# -- System load (doctor helper) --
 collect_system_load() {
   store "system.fd_count" "$(ls /proc/*/fd 2>/dev/null | wc -l || echo "0")"
+  # Number of logged in users
   store "system.users" "$(users | wc -w)"
+  # Running services
   if has_cmd systemctl; then
     store "system.services_running" "$(systemctl list-units --type=service --state=running 2>/dev/null | grep -c "running" || echo "0")"
   fi
 }
 
-# -- CPU load averages --
-collect_cpu_load() {
-  local loadavg; loadavg=$(< /proc/loadavg) 2>/dev/null || true
-  store "cpu.load_1m" "$(echo "${loadavg:-}" | awk '{print $1}')"
-  store "cpu.load_5m" "$(echo "${loadavg:-}" | awk '{print $2}')"
-  store "cpu.load_15m" "$(echo "${loadavg:-}" | awk '{print $3}')"
-  # Per-core frequencies
-  if [[ -d /sys/devices/system/cpu ]]; then
-    local idx=0
-    for cpuf in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do
-      if [[ -r "$cpuf" ]]; then
-        local freq=$(< "$cpuf"); freq=$((freq / 1000))
-        store "cpu.core.${idx}.freq" "$freq"; ((idx++)) || true
-      fi
-    done
-    store "cpu.core_count" "$idx"
-  fi
-  # Physical cores
-  local phys=0
-  [[ -d /sys/devices/system/cpu ]] && for dir in /sys/devices/system/cpu/cpu[0-9]*/topology/core_id; do
-    [[ -r "$dir" ]] || continue; phys=$((phys + 1))
-  done 2>/dev/null || true
-  store "cpu.physical_total" "$phys"
+# ──────────────────────────────────────────────
+#  COLLECT ALL (runs all collectors)
+# ──────────────────────────────────────────────
+
+collect_all() {
+  collect_machine
+  collect_cpu
+  collect_memory
+  collect_storage
+  collect_gpu
+  collect_battery
+  collect_fans
+  collect_temps
+  collect_displays
+  collect_motherboard
+  collect_bios
+  collect_network
+  collect_audio
+  collect_usb
+  collect_pci
+  collect_os
+  collect_kernel
+  collect_security
+  collect_virtualization
+  collect_uptime
+  collect_processes
+  collect_system_load
 }
 
-# ── CPU usage (needs brief sleep) ──────────────
-
-collect_cpu_usage() {
-  local stat prev_idle prev_total
-  stat=$(safe_read /proc/stat | head -1) || true
-  local user nice sys idle iowait irq softirq steal
-  read -r _ user nice sys idle iowait irq softirq steal <<< "$stat"
-  prev_total=$((user + nice + sys + idle + iowait + irq + softirq + steal))
-  prev_idle=$((idle + iowait))
-  sleep 0.3
-  stat=$(safe_read /proc/stat | head -1) || true
-  read -r _ user nice sys idle iowait irq softirq steal <<< "$stat"
-  local total=$((user + nice + sys + idle + iowait + irq + softirq + steal))
-  local idl=$((idle + iowait))
-  local total_d=$((total - prev_total))
-  local idle_d=$((idl - prev_idle))
-  if (( total_d > 0 )); then
-    local usage=$(( 100 * (total_d - idle_d) / total_d ))
-    store "cpu.usage_percent" "$usage"
-  fi
+collect_all_with_usage() {
+  collect_all
+  collect_cpu_usage
 }
 
-# ── Terminal output ─────────────────────────────
-
-section() {
-  local title="$1" color="${2:-$B}" len=60
-  local pad=$(( (len - ${#title} - 2) / 2 ))
-  local left=$pad right=$(( len - ${#title} - 2 - pad ))
-  printf "\n${color}${BOLD}%s" "$TL"
-  printf "%0.s${H_LINE}" $(seq 1 $left)
-  printf " %s " "$title"
-  printf "%0.s${H_LINE}" $(seq 1 $right)
-  printf "%s${NC}\n" "$TR"
-}
-
-kv() { local k="$1" v="$2" c="${3:-$NC}"; printf "${D}${V_LINE}${NC} ${BOLD}%-20s${NC} ${c}%s${NC}\n" "$k:" "$v"; }
-section_end() { printf "${D}%s${NC}\n" "${BL}$(printf "%0.s${H_LINE}" $(seq 1 62))${BR}"; }
+# ──────────────────────────────────────────────
+#  TERMINAL RENDERER
+# ──────────────────────────────────────────────
 
 render_machine() {
   section "Machine"
-  kv "Hostname" "$(get machine.hostname)" "$G"
-  kv "Product" "$(get machine.product)"
-  kv "Vendor" "$(get machine.vendor)"
+  checked_kv "Hostname" "$(get machine.hostname)"
+  checked_kv "Product" "$(get machine.product)"
+  checked_kv "Vendor" "$(get machine.vendor)"
+  checked_kv "Family" "$(get machine.family)"
+  checked_kv "UUID" "$(get machine.uuid)"
   section_end
 }
 
 render_cpu() {
   section "CPU"
-  kv "Model" "$(get cpu.model)" "$G"
-  kv "Vendor" "$(get cpu.vendor)"
-  kv "Cores" "$(get cpu.logical)"
+  checked_kv "Model" "$(get cpu.model)"
+  checked_kv "Vendor" "$(get cpu.vendor)"
+  checked_kv "Architecture" "$(get cpu.arch)"
+  checked_kv "Logical Cores" "$(get cpu.logical)"
+  checked_kv "Physical Cores" "$(get cpu.physical_total)"
+  checked_kv "Max MHz" "$(get cpu.max_mhz)"
+  checked_kv "Current MHz" "$(get cpu.mhz)"
+  checked_kv "Flags" "$(get cpu.flags)" "$D"
+  local usage=$(get cpu.usage_percent)
+  if [[ -n "$usage" ]]; then
+    if (( usage > 80 )); then
+      kv "Usage" "${usage}%" "$R"
+    elif (( usage > 50 )); then
+      kv "Usage" "${usage}%" "$Y"
+    else
+      kv "Usage" "${usage}%" "$G"
+    fi
+  fi
+  kv "Load (1/5/15m)" "$(get cpu.load_1m) / $(get cpu.load_5m) / $(get cpu.load_15m)"
+  checked_kv "Cache" "$(get cpu.cache)"
+
+  # Per-core frequencies
+  local cc=$(get cpu.core_count)
+  if [[ -n "$cc" && "$cc" -gt 0 ]]; then
+    sub_header "Per-Core Frequencies"
+    local line=""
+    for ((i=0; i<cc; i++)); do
+      local freq=$(get "cpu.core.${i}.freq")
+      line+=" Core${i}:${freq}MHz"
+    done
+    printf "${D}${V_LINE}${NC}  %s\n" "$line"
+  fi
+  section_end
+}
+
+render_gpu() {
+  local count=$(get gpu.count)
+  section "GPU"
+  if [[ "$count" -gt 0 ]]; then
+    for ((i=0; i<count; i++)); do
+      checked_kv "Device $((i+1))" "$(get "gpu.${i}.device")"
+      kv "  Vendor" "$(get "gpu.${i}.vendor")" "$D"
+    done
+  else
+    kv "GPU" "${D}No GPU information found${NC}" "$D"
+  fi
   section_end
 }
 
 render_memory() {
   section "Memory"
-  local t=$(($(get memory.total_kb)/1024)) a=$(($(get memory.avail_kb)/1024))
-  kv "Total" "${t} MiB"
-  kv "Available" "${a} MiB"
-  if [[ "$t" -gt 0 ]]; then
-    local pct=$(( (t-a)*100/t )) bar_len=30 filled=$((pct*bar_len/100))
-    local bar="[${G}"; for ((i=0;i<filled;i++)); do bar+="█"; done
-    bar+="${D}"; for ((i=0;i<bar_len-filled;i++)); do bar+="░"; done
+  local total=$(get memory.total_kb)
+  local avail=$(get memory.avail_kb)
+  local free=$(get memory.free_kb)
+  local total_mib=$((total / 1024))
+  local avail_mib=$((avail / 1024))
+  local free_mib=$((free / 1024))
+  local used_mib=$((total_mib - avail_mib))
+  local pct=0
+  if [[ "$total" -gt 0 ]]; then
+    pct=$(( (total - avail) * 100 / total ))
+  fi
+
+  kv "Total" "${total_mib} MiB"
+  if (( pct > 80 )); then
+    kv "Used" "${used_mib} MiB" "$R"
+  elif (( pct > 50 )); then
+    kv "Used" "${used_mib} MiB" "$Y"
+  else
+    kv "Used" "${used_mib} MiB"
+  fi
+  kv "Available" "${avail_mib} MiB"
+  kv "Free" "${free_mib} MiB"
+
+  # Memory bar
+  if [[ "$total" -gt 0 ]]; then
+    local bar_len=30
+    local filled=$(( pct * bar_len / 100 ))
+    local empty=$(( bar_len - filled ))
+    local bar=""
+    bar+="["
+    if (( pct > 80 )); then
+      bar+="${R}"
+    elif (( pct > 50 )); then
+      bar+="${Y}"
+    else
+      bar+="${G}"
+    fi
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    bar+="${D}"
+    for ((i=0; i<empty; i++)); do bar+="░"; done
     bar+="${NC}] ${pct}%"
     kv "Usage" "$bar"
   fi
-  section_end
-}
 
-render_os() {
-  section "Operating System"
-  kv "OS" "$(get os.pretty_name)" "$G"
-  kv "Version" "$(get os.version_id)"
-  kv "Architecture" "$(get os.arch)"
-  kv "User" "$(get os.user)"
-  section_end
-}
-
-render_kernel() {
-  section "Kernel"
-  kv "Release" "$(get kernel.release)" "$G"
-  kv "Version" "$(get kernel.version)"
-  section_end
-}
-
-render_uptime() {
-  section "Uptime"
-  kv "Uptime" "$(get uptime.display)"
-  section_end
-}
-
-render_gpu() {
-  local c=$(get gpu.count)
-  section "GPU"
-  if [[ "$c" -gt 0 ]]; then
-    for ((i=0; i<c; i++)); do
-      kv "Device $((i+1))" "$(get gpu.${i}.device)"
-      kv "  Vendor" "$(get gpu.${i}.vendor)" "$D"
-    done
-  else
-    kv "GPU" "${D}N/A${NC}" "$D"
+  local swap_total=$(get memory.swap_total_kb)
+  local swap_free=$(get memory.swap_free_kb)
+  if [[ -n "$swap_total" && "$swap_total" -gt 0 ]]; then
+    local swap_total_mib=$((swap_total / 1024))
+    local swap_free_mib=$((swap_free / 1024))
+    local swap_used=$((swap_total_mib - swap_free_mib))
+    kv "Swap Total" "${swap_total_mib} MiB"
+    kv "Swap Used" "${swap_used} MiB"
   fi
   section_end
 }
 
 render_storage() {
-  local c=$(get storage.count)
   section "Storage"
-  if [[ "$c" -gt 0 ]]; then
-    for ((i=0; i<c; i++)); do
-      kv "Disk $((i+1))" "/dev/$(get storage.${i}.name)"
-      kv "  Size" "$(get storage.${i}.size)"
-      local m=$(get storage.${i}.model); m="${m%% }"
-      [[ -n "$m" ]] && kv "  Model" "$m" "$D"
+  local count=$(get storage.count)
+  if [[ "$count" -gt 0 ]]; then
+    for ((i=0; i<count; i++)); do
+      local name=$(get "storage.${i}.name")
+      local size=$(get "storage.${i}.size")
+      local model=$(get "storage.${i}.model")
+      local model_clean="${model%% }"
+      kv "Disk $((i+1))" "/dev/${name}"
+      kv "  Size" "$size"
+      [[ -n "$model_clean" ]] && kv "  Model" "$model_clean" "$D"
     done
+  else
+    kv "Disks" "${D}No disk information${NC}" "$D"
   fi
-  local fc=$(get fs.count)
-  if [[ "$fc" -gt 0 ]]; then
+
+  # Filesystems
+  local fcount=$(get fs.count)
+  if [[ "$fcount" -gt 0 ]]; then
+    sub_header "Filesystem Usage"
     printf "${D}${V_LINE}  %-20s %8s %8s %8s %5s${NC}\n" "Mount" "Size" "Used" "Avail" "Use%"
-    for ((i=0; i<fc; i++)); do
-      local m=$(get fs.${i}.mount) s=$(get fs.${i}.size) u=$(get fs.${i}.used)
-      local a=$(get fs.${i}.avail) p=$(get fs.${i}.use_pct)
-      local col=$NC; [[ -n "$p" ]] && (( p > 90 )) && col=$R; [[ -n "$p" ]] && (( p > 75 && p <= 90 )) && col=$Y
-      printf "${D}${V_LINE}${NC}  %-20s %8s %8s %8s ${col}%3s%%${NC}\n" "$m" "$s" "$u" "$a" "$p"
+    for ((i=0; i<fcount; i++)); do
+      local mount=$(get "fs.${i}.mount")
+      local size=$(get "fs.${i}.size")
+      local used=$(get "fs.${i}.used")
+      local avail=$(get "fs.${i}.avail")
+      local use_pct=$(get "fs.${i}.use_pct")
+      local col=$NC
+      if [[ -n "$use_pct" && "$use_pct" -gt 90 ]]; then col=$R
+      elif [[ -n "$use_pct" && "$use_pct" -gt 75 ]]; then col=$Y
+      fi
+      printf "${D}${V_LINE}${NC}  %-20s %8s %8s %8s ${col}%3s%%${NC}\n" "$mount" "$size" "$used" "$avail" "$use_pct"
     done
   fi
   section_end
 }
 
 render_battery() {
-  local c=$(get battery.count)
-  [[ "$c" -eq 0 ]] && return
+  local count=$(get battery.count)
+  [[ "$count" -eq 0 ]] && return
   section "Battery"
-  for ((i=0; i<c; i++)); do
-    kv "Name" "$(get battery.${i}.name)"
-    kv "  Status" "$(get battery.${i}.status)"
-    local cap=$(get battery.${i}.capacity)
-    local cap_col=$G; [[ -n "$cap" ]] && (( cap < 20 )) && cap_col=$R
-    [[ -n "$cap" ]] && (( cap >= 20 && cap < 50 )) && cap_col=$Y
-    [[ -n "$cap" ]] && kv "  Capacity" "${cap}%" "$cap_col"
-    kv "  Technology" "$(get battery.${i}.technology)" "$D"
-    kv "  Model" "$(get battery.${i}.model)" "$D"
-    kv "  Manufacturer" "$(get battery.${i}.manufacturer)" "$D"
+  for ((i=0; i<count; i++)); do
+    local name=$(get "battery.${i}.name")
+    local status=$(get "battery.${i}.status")
+    local cap=$(get "battery.${i}.capacity")
+    local tech=$(get "battery.${i}.technology")
+    local model=$(get "battery.${i}.model")
+    local mfr=$(get "battery.${i}.manufacturer")
+    local wh=$(get "battery.${i}.wh_design")
+    kv "Name" "$name"
+    kv "  Status" "$status"
+    local cap_col=$G
+    if [[ -n "$cap" ]]; then
+      (( cap < 20 )) && cap_col=$R
+      (( cap >= 20 && cap < 50 )) && cap_col=$Y
+      kv "  Capacity" "${cap}%" "$cap_col"
+    fi
+    [[ -n "$tech" ]] && kv "  Technology" "$tech" "$D"
+    [[ -n "$model" ]] && kv "  Model" "$model" "$D"
+    [[ -n "$mfr" ]] && kv "  Manufacturer" "$mfr" "$D"
+    [[ -n "$wh" ]] && kv "  Design" "${wh} Wh" "$D"
   done
   section_end
 }
 
 render_fans() {
-  local c=$(get fan.count)
-  [[ "$c" -eq 0 ]] && return
+  local count=$(get fan.count)
+  [[ "$count" -eq 0 ]] && return
   section "Fans"
-  for ((i=0; i<c; i++)); do
-    local n=$(get fan.${i}.name); [[ -z "$n" ]] && n="Fan $((i+1))"
-    kv "$n" "$(get fan.${i}.rpm) RPM"
+  for ((i=0; i<count; i++)); do
+    local name=$(get "fan.${i}.name")
+    local rpm=$(get "fan.${i}.rpm")
+    [[ -z "$name" ]] && name="Fan $((i+1))"
+    kv "$name" "${rpm} RPM"
   done
   section_end
 }
 
 render_temps() {
-  local c=$(get temp.count)
-  [[ "$c" -eq 0 ]] && return
+  local count=$(get temp.count)
+  [[ "$count" -eq 0 ]] && return
   section "Temperatures"
-  for ((i=0; i<c; i++)); do
-    local cel=$(get temp.${i}.celsius) cint=${cel%.*}
-    local col=$G; (( cint >= 80 )) && col=$R; (( cint >= 60 && cint < 80 )) && col=$Y
-    kv "$(get temp.${i}.name)" "${cel}°C" "$col"
+  for ((i=0; i<count; i++)); do
+    local name=$(get "temp.${i}.name")
+    local celsius=$(get "temp.${i}.celsius")
+    local col=$G
+    if [[ -n "$celsius" ]]; then
+      local cint=${celsius%.*}
+      (( cint >= 80 )) && col=$R
+      (( cint >= 60 && cint < 80 )) && col=$Y
+    fi
+    kv "$name" "${celsius}°C" "$col"
   done
   section_end
 }
 
 render_displays() {
-  local c=$(get display.count)
+  local count=$(get display.count)
   section "Displays"
-  if [[ "$c" -gt 0 ]]; then
-    for ((i=0; i<c; i++)); do
-      local n=$(get display.${i}.name) w=$(get display.${i}.width) h=$(get display.${i}.height)
-      [[ -n "$w" ]] && kv "Display $((i+1))" "${n}  ${w}x${h}" || kv "Display $((i+1))" "$n"
+  if [[ "$count" -gt 0 ]]; then
+    for ((i=0; i<count; i++)); do
+      local name=$(get "display.${i}.name")
+      local w=$(get "display.${i}.width")
+      local h=$(get "display.${i}.height")
+      if [[ -n "$w" && -n "$h" ]]; then
+        kv "Display $((i+1))" "$name"
+        kv "  Resolution" "${w}x${h}"
+      else
+        kv "Display $((i+1))" "$name"
+      fi
     done
   else
-    kv "Displays" "${D}N/A${NC}" "$D"
+    kv "Displays" "${D}No display information${NC}" "$D"
   fi
-  local bl=$(get display.backlight) mbl=$(get display.max_backlight)
-  [[ -n "$bl" && "$mbl" -gt 0 ]] && kv "Brightness" "$((bl * 100 / mbl))%"
+
+  local bl=$(get display.backlight)
+  local mbl=$(get display.max_backlight)
+  if [[ -n "$bl" && -n "$mbl" ]]; then
+    local bl_pct=$((bl * 100 / mbl))
+    kv "Brightness" "${bl_pct}%"
+  fi
   section_end
 }
 
 render_motherboard() {
-  local v=$(get board.vendor) n=$(get board.name)
-  [[ -z "$v" && -z "$n" ]] && return
+  local vendor=$(get board.vendor)
+  local name=$(get board.name)
+  [[ -z "$vendor" && -z "$name" ]] && return
   section "Motherboard"
-  kv "Vendor" "$v"
-  kv "Model" "$n"
-  kv "Version" "$(get board.version)"
+  checked_kv "Vendor" "$vendor"
+  checked_kv "Model" "$name"
+  checked_kv "Version" "$(get board.version)"
+  checked_kv "Serial" "$(get board.serial)" "$D"
   section_end
 }
 
 render_bios() {
-  local v=$(get bios.vendor)
-  [[ -z "$v" ]] && return
+  local vendor=$(get bios.vendor)
+  [[ -z "$vendor" ]] && return
   section "BIOS"
-  kv "Vendor" "$v"
-  kv "Version" "$(get bios.version)"
-  kv "Date" "$(get bios.date)"
-  kv "Mode" "$(get bios.mode)"
+  checked_kv "Vendor" "$vendor"
+  checked_kv "Version" "$(get bios.version)"
+  checked_kv "Date" "$(get bios.date)"
+  checked_kv "Mode" "$(get bios.mode)"
+  checked_kv "Release" "$(get bios.release)"
   section_end
 }
 
 render_network() {
-  local c=$(get net.count)
+  local count=$(get net.count)
   section "Network"
-  for ((i=0; i<c; i++)); do
-    local n=$(get net.${i}.name) a=$(get net.${i}.address) s=$(get net.${i}.state) sp=$(get net.${i}.speed)
-    local sc=$D; [[ "$s" == "up" ]] && sc=$G
-    kv "Interface $((i+1))" "$n"
-    kv "  MAC" "$a" "$D"
-    kv "  State" "$s" "$sc"
-    [[ -n "$sp" && "$sp" -gt 0 ]] && kv "  Speed" "${sp} Mbps"
-    local rx=$(get net.${i}.rx_bytes) tx=$(get net.${i}.tx_bytes)
-    [[ -n "$rx" ]] && kv "  RX" "$(fmt_size_bytes "$rx")" && kv "  TX" "$(fmt_size_bytes "$tx")"
+  for ((i=0; i<count; i++)); do
+    local name=$(get "net.${i}.name")
+    local addr=$(get "net.${i}.address")
+    local state=$(get "net.${i}.state")
+    local speed=$(get "net.${i}.speed")
+    local rx=$(get "net.${i}.rx_bytes")
+    local tx=$(get "net.${i}.tx_bytes")
+    local state_col=$D
+    [[ "$state" == "up" ]] && state_col=$G
+    kv "Interface $((i+1))" "$name"
+    kv "  MAC" "$addr" "$D"
+    kv "  State" "$state" "$state_col"
+    [[ -n "$speed" && "$speed" -gt 0 ]] && kv "  Speed" "${speed} Mbps"
+    if [[ -n "$rx" ]]; then
+      kv "  RX" "$(fmt_size_bytes "$rx")"
+      kv "  TX" "$(fmt_size_bytes "$tx")"
+    fi
   done
-  local gw=$(get net.default_gateway); [[ -n "$gw" ]] && kv "Gateway" "$gw"
+  local gw=$(get net.default_gateway)
+  [[ -n "$gw" ]] && kv "Default Gateway" "$gw"
   section_end
 }
 
 render_audio() {
-  local c=$(get audio.count)
-  [[ "$c" -eq 0 ]] && return
+  local count=$(get audio.count)
+  [[ "$count" -eq 0 ]] && return
   section "Audio"
-  for ((i=0; i<c; i++)); do
-    kv "Device $((i+1))" "$(get audio.${i}.device)"
-    kv "  PCI" "$(get audio.${i}.pci)" "$D"
+  for ((i=0; i<count; i++)); do
+    local dev=$(get "audio.${i}.device")
+    local pci=$(get "audio.${i}.pci")
+    kv "Device $((i+1))" "$dev"
+    kv "  PCI" "$pci" "$D"
   done
   local alsa=$(get audio.alsa_info)
   [[ -n "$alsa" ]] && kv "ALSA" "$alsa" "$D"
@@ -763,70 +1344,165 @@ render_audio() {
 }
 
 render_usb() {
-  local c=$(get usb.count)
+  local count=$(get usb.count)
   section "USB"
-  if [[ "$c" -gt 0 ]]; then
-    kv "Devices" "$c"
-    for ((i=0; i<c && i<8; i++)); do
-      kv "  $((i+1))" "$(get usb.${i}.description) ($(get usb.${i}.id))" "$D"
+  if [[ "$count" -gt 0 ]]; then
+    kv "Devices" "$count"
+    for ((i=0; i<count && i<8; i++)); do
+      local desc=$(get "usb.${i}.description")
+      local id=$(get "usb.${i}.id")
+      kv "  $((i+1))" "${desc} (${id})" "$D"
     done
-    (( c > 8 )) && kv "  ..." "${D}and $((c-8)) more${NC}" "$D"
+    if (( count > 8 )); then
+      kv "  ..." "${D}and $((count - 8)) more${NC}" "$D"
+    fi
   else
-    kv "Devices" "${D}N/A${NC}" "$D"
+    kv "Devices" "${D}No USB information${NC}" "$D"
   fi
   section_end
 }
 
 render_pci() {
-  local c=$(get pci.count)
+  local count=$(get pci.count)
   section "PCI Devices"
-  if [[ "$c" -gt 0 ]]; then
-    local shown=0
-    for ((i=0; i<c && shown<12; i++)); do
-      local desc=$(get pci.${i}.description)
-      if echo "$desc" | grep -qiE "VGA|3D|Audio|Net|USB|SATA|NVMe|AHCI|Ethernet|WiFi|Bluetooth|Display"; then
-        kv "$(get pci.${i}.slot)" "$desc" "$D"; ((shown++)) || true
+  if [[ "$count" -gt 0 ]]; then
+    local displayed=0
+    for ((i=0; i<count && displayed<12; i++)); do
+      local slot=$(get "pci.${i}.slot")
+      local desc=$(get "pci.${i}.description")
+      # Show interesting devices
+      if echo "$desc" | grep -qiE "VGA|3D|Audio|Net|USB|SATA|NVMe|AHCI|Ethernet|WiFi|Bluetooth|Display|HDMI"; then
+        kv "$slot" "$desc" "$D"
+        ((displayed++)) || true
       fi
     done
-    (( c > shown )) && kv "  ..." "${D}and $((c-shown)) more${NC}" "$D"
+    if (( count > displayed )); then
+      kv "  ..." "${D}and $((count - displayed)) more devices${NC}" "$D"
+    fi
+  else
+    kv "Devices" "${D}No PCI information${NC}" "$D"
   fi
+  section_end
+}
+
+render_os() {
+  section "Operating System"
+  checked_kv "OS" "$(get os.pretty_name)"
+  checked_kv "ID" "$(get os.id)"
+  checked_kv "Version" "$(get os.version_id)"
+  checked_kv "Codename" "$(get os.codename)"
+  checked_kv "Architecture" "$(get os.arch)"
+  checked_kv "Hostname" "$(get os.hostname)"
+  checked_kv "User" "$(get os.user)"
+  checked_kv "Desktop" "$(get os.desktop)"
+  checked_kv "Shell" "$(get os.shell)"
+  checked_kv "Terminal" "$(get os.term)"
+  section_end
+}
+
+render_kernel() {
+  section "Kernel"
+  checked_kv "Release" "$(get kernel.release)"
+  checked_kv "Version" "$(get kernel.version)"
+  checked_kv "Machine" "$(get kernel.machine)"
+  checked_kv "Modules" "$(get kernel.modules)"
+  checked_kv "Cmdline" "$(get kernel.cmdline)" "$D"
   section_end
 }
 
 render_security() {
   section "Security"
-  local aa=$(get security.apparmor) se=$(get security.selinux) ufw=$(get security.ufw)
-  local sb=$(get security.secure_boot) aslr=$(get security.aslr)
-  [[ -n "$aa" ]] && kv "AppArmor" "$aa" "$( [[ "$aa" == "enabled" ]] && echo "$G" || echo "$R" )"
-  [[ -n "$se" ]] && kv "SELinux" "$se" "$D"
-  [[ -n "$ufw" ]] && kv "UFW" "$ufw" "$( [[ "$ufw" == "active" ]] && echo "$G" || echo "$Y" )"
-  [[ -n "$sb" ]] && kv "Secure Boot" "$sb"
-  [[ -n "$aslr" ]] && kv "ASLR" "$aslr"
-  local yama=$(get security.ptrace_scope); [[ -n "$yama" ]] && kv "Ptrace Scope" "$yama"
+  local aa=$(get security.apparmor)
+  local se=$(get security.selinux)
+  local ufw=$(get security.ufw)
+  local sb=$(get security.secure_boot)
+  local aslr=$(get security.aslr)
+  local yama=$(get security.ptrace_scope)
+
+  if [[ -n "$aa" ]]; then
+    local aa_col=$G
+    [[ "$aa" == "disabled" ]] && aa_col=$R
+    kv "AppArmor" "$aa" "$aa_col"
+  fi
+  if [[ -n "$se" ]]; then
+    local se_col=$G
+    [[ "$se" =~ disabled|not_present ]] && se_col=$D
+    kv "SELinux" "$se" "$se_col"
+  fi
+  if [[ -n "$ufw" ]]; then
+    local ufw_col=$G
+    [[ "$ufw" =~ inactive|disabled ]] && ufw_col=$Y
+    kv "UFW" "$ufw" "$ufw_col"
+  fi
+  if [[ -n "$sb" ]]; then
+    local sb_col=$G
+    [[ "$sb" == "disabled" ]] && sb_col=$R
+    kv "Secure Boot" "$sb" "$sb_col"
+  fi
+  checked_kv "ASLR" "$aslr"
+  checked_kv "Ptrace Scope" "$yama"
   section_end
 }
 
 render_virtualization() {
-  local virt=$(get virtualization.type) is_vm=$(get virtualization.is_vm)
-  [[ "$virt" == "none" ]] && return
+  local virt=$(get virtualization.type)
+  local is_vm=$(get virtualization.is_vm)
+  local container=$(get virtualization.container)
+  virt="${virt:-none}"
+  if [[ "$virt" == "none" ]] && [[ -z "$container" ]]; then
+    return
+  fi
   section "Virtualization"
-  kv "Type" "$( [[ "$is_vm" == "yes" ]] && echo "${Y}${virt}${NC}" || echo "$virt" )"
+  if [[ "$is_vm" == "yes" ]]; then
+    kv "Hypervisor" "${Y}${virt}${NC}" "$Y"
+  else
+    checked_kv "Type" "$virt"
+  fi
+  [[ -n "$container" ]] && kv "Container" "$container" "$Y"
+  section_end
+}
+
+render_uptime() {
+  section "Uptime"
+  local display=$(get uptime.display)
+  local days=$(get uptime.days)
+  if [[ -n "$days" && "$days" -gt 30 ]]; then
+    kv "Uptime" "$display" "$Y"
+  else
+    kv "Uptime" "$display"
+  fi
+  local btime=$(get uptime.boot_time)
+  if [[ -n "$btime" ]]; then
+    kv "Boot Time" "$(date -d "@$btime" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$D"
+  fi
   section_end
 }
 
 render_processes() {
   section "Processes"
-  kv "Total" "$(get process.total)"
-  kv "Running" "$(get process.running)" "$G"
-  kv "Sleeping" "$(get process.sleeping)" "$D"
-  local z=$(get process.zombie); [[ -n "$z" && "$z" -gt 0 ]] && kv "Zombie" "${R}${z}${NC}" "$R"
-  kv "Stopped" "$(get process.stopped)"
-  local tc=$(get process.top_count)
-  if [[ "$tc" -gt 0 ]]; then
+  local total=$(get process.total)
+  local running=$(get process.running)
+  local sleeping=$(get process.sleeping)
+  local zombie=$(get process.zombie)
+  local stopped=$(get process.stopped)
+  kv "Total" "$total"
+  kv "Running" "$running" "$G"
+  kv "Sleeping" "$sleeping" "$D"
+  if [[ -n "$zombie" && "$zombie" -gt 0 ]]; then
+    kv "Zombie" "${R}${zombie}${NC}" "$R"
+  fi
+  kv "Stopped" "$stopped"
+
+  local top_count=$(get process.top_count)
+  if [[ "$top_count" -gt 0 ]]; then
+    sub_header "Top CPU Processes"
     printf "${D}${V_LINE}  %6s %5s %5s %s${NC}\n" "PID" "CPU%" "MEM%" "Command"
-    for ((i=0; i<tc; i++)); do
-      printf "${D}${V_LINE}${NC}  %6s %4s%% %4s%% %s\n" "$(get process.top.${i}.pid)" \
-        "$(get process.top.${i}.cpu)" "$(get process.top.${i}.mem)" "$(get process.top.${i}.cmd)"
+    for ((i=0; i<top_count; i++)); do
+      local pid=$(get "process.top.${i}.pid")
+      local cpu=$(get "process.top.${i}.cpu")
+      local mem=$(get "process.top.${i}.mem")
+      local cmd=$(get "process.top.${i}.cmd")
+      printf "${D}${V_LINE}${NC}  %6s %4s%% %4s%% %s\n" "$pid" "$cpu" "$mem" "$cmd"
     done
   fi
   section_end
@@ -834,37 +1510,114 @@ render_processes() {
 
 render_system_load() {
   section "System Load"
-  kv "Fds" "$(get system.fd_count)"
-  kv "Users" "$(get system.users)"
-  kv "Services" "$(get system.services_running)"
+  checked_kv "File Descriptors" "$(get system.fd_count)"
+  checked_kv "Logged In Users" "$(get system.users)"
+  checked_kv "Running Services" "$(get system.services_running)"
   section_end
 }
 
-# ── Exporters ──────────────────────────────────
+render_all() {
+  render_machine
+  render_os
+  render_kernel
+  render_cpu
+  render_memory
+  render_storage
+  render_gpu
+  render_battery
+  render_fans
+  render_temps
+  render_displays
+  render_motherboard
+  render_bios
+  render_network
+  render_audio
+  render_usb
+  render_pci
+  render_security
+  render_virtualization
+  render_uptime
+  render_processes
+  render_system_load
+}
+
+# ──────────────────────────────────────────────
+#  EXPORTERS
+# ──────────────────────────────────────────────
+
+# Collect all keys into a JSON-compatible structure
+to_json() {
+  local indent="${1:-2}"
+  python3 -c "
+import json, sys, os
+data = {}
+keys = sorted(os.environ.keys())
+for k in keys:
+    if k.startswith('SYS_'):
+        parts = k[4:].split('__')
+        d = data
+        for p in parts[:-1]:
+            d = d.setdefault(p, {})
+        d[parts[-1]] = os.environ[k]
+print(json.dumps(data, indent=$indent))
+" 2>/dev/null || {
+    # Fallback: simple manual JSON using awk
+    printf "{\n"
+    local first=true
+    for key in "${!SYS[@]}"; do
+      $first || printf ",\n"
+      first=false
+      printf "  \"%s\": \"%s\"" "$key" "${SYS[$key]}"
+    done
+    printf "\n}\n"
+  }
+}
 
 export_json() {
+  # Build JSON directly without env var roundtrip
   python3 -c "
-import json, sys
+import json, re, sys
+
+# Read from stdin as a simple key=value format
 data = {}
 for line in sys.stdin:
     line = line.strip()
-    if not line: continue
+    if not line:
+        continue
     idx = line.find('=')
-    if idx < 0: continue
-    key, val = line[:idx], line[idx+1:]
+    if idx < 0:
+        continue
+    key = line[:idx]
+    val = line[idx+1:]
     parts = key.split('.')
     d = data
     for p in parts[:-1]:
         d = d.setdefault(p, {})
     d[parts[-1]] = val
+
 print(json.dumps(data, indent=2))
-" <<< "$(for k in "${!SYS[@]}"; do printf "%s=%s\n" "$k" "${SYS[$k]}"; done)" 2>/dev/null || {
-    printf "{\n"; local first=true
-    for k in "${!SYS[@]}"; do
-      $first || printf ",\n"; first=false
-      local v="${SYS[$k]}"; v="${v//\\/\\\\}"; v="${v//\"/\\\"}"
-      printf '  "%s": "%s"' "$k" "$v"
-    done; printf "\n}\n"
+" <<< "$(for key in "${!SYS[@]}"; do printf "%s=%s\n" "$key" "${SYS[$key]}"; done)" 2>/dev/null || {
+    # Fallback: manually build JSON
+    printf "{\n"
+    local keys=() i=0
+    for key in "${!SYS[@]}"; do
+      keys+=("$key")
+    done
+    # Sort keys
+    IFS=$'\n' keys=($(sort <<<"${keys[*]}")); unset IFS
+    local first=true
+    for key in "${keys[@]}"; do
+      $first || printf ",\n"
+      first=false
+      # Escape special chars and wrap in quotes
+      local escaped="${SYS[$key]}"
+      escaped="${escaped//\\/\\\\}"
+      escaped="${escaped//\"/\\\"}"
+      escaped="${escaped//$'\n'/\\n}"
+      escaped="${escaped//$'\t'/\\t}"
+      printf '  "%s": "%s"' "$key" "$escaped"
+    done
+    printf "\n}\n"
   }
 }
 
@@ -874,132 +1627,402 @@ import json, sys, yaml
 try:
     data = json.load(sys.stdin)
     yaml.dump(data, sys.stdout, default_flow_style=False, allow_unicode=True)
-except Exception:
-    print('error: YAML export requires PyYAML (pip install pyyaml)', file=sys.stderr)
+except Exception as e:
+    print(f'error: {e}', file=sys.stderr)
     sys.exit(1)
-" 2>/dev/null || export_json
+" 2>/dev/null || {
+    warn "YAML export requires PyYAML (pip install pyyaml), falling back to JSON-like output"
+    export_json
+  }
 }
 
-# Markdown: iterate sections that have data
 export_markdown() {
-  printf "# syslens System Report\n\n**Date:** %s  \n**Host:** %s\n\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$(get machine.hostname)"
+  printf "# syslens System Report\n\n"
+  printf "**Date:** %s\n\n" "$(date '+%Y-%m-%d %H:%M:%S')"
+  printf "**Host:** %s\n\n" "$(get machine.hostname)"
+
   local sections=(
-    "Machine|machine.hostname|Hostname|machine.product|Product|machine.vendor|Vendor"
-    "OS|os.pretty_name|OS|os.version_id|Version|os.arch|Architecture|os.hostname|Hostname|os.user|User"
-    "Kernel|kernel.release|Release|kernel.version|Version|kernel.machine|Architecture"
-    "CPU|cpu.model|Model|cpu.logical|Cores|cpu.mhz|MHz|cpu.load_1m|Load 1m"
-    "Memory|memory.total_kb|Total (KiB)|memory.avail_kb|Available (KiB)|memory.free_kb|Free (KiB)"
+    "Machine:Machine Information"
+    "OS:Operating System"
+    "Kernel:Kernel"
+    "CPU:CPU"
+    "Memory:Memory"
+    "Storage:Storage"
+    "GPU:GPU"
+    "Battery:Battery"
+    "Fans:Cooling Fans"
+    "Temps:Temperatures"
+    "Displays:Displays"
+    "Motherboard:Motherboard"
+    "BIOS:BIOS"
+    "Network:Network"
+    "Audio:Audio"
+    "USB:USB Devices"
+    "PCI:PCI Devices"
+    "Security:Security"
+    "Virtualization:Virtualization"
+    "Uptime:Uptime"
+    "Processes:Processes"
   )
+
   for entry in "${sections[@]}"; do
-    local title="${entry%%|*}" rest="${entry#*|}" has_data=false rows=""
-    IFS='|' read -ra fields <<< "$rest"
-    for ((j=0; j<${#fields[@]}; j+=2)); do
-      local fval="$(get "${fields[$j]}")"
-      if [[ -n "$fval" && "$fval" != "0" ]]; then
-        has_data=true; rows+="| ${fields[$((j+1))]} | $fval |\n"
-      fi
-    done
-    $has_data && printf "## %s\n\n| Key | Value |\n| --- | --- |\n%b\n" "$title" "$rows"
+    local prefix="${entry%%:*}"
+    local title="${entry##*:}"
+    local has_data=false
+
+    case "$prefix" in
+      Machine)
+        if [[ -n "$(get machine.hostname)" ]]; then
+          has_data=true
+          printf "## %s\n\n" "$title"
+          printf "| Key | Value |\n| --- | --- |\n"
+          printf "| Hostname | %s |\n" "$(get machine.hostname)"
+          printf "| Product | %s |\n" "$(get machine.product)"
+          printf "| Vendor | %s |\n" "$(get machine.vendor)"
+          printf "| UUID | %s |\n" "$(get machine.uuid)"
+        fi
+        ;;
+      OS)
+        if [[ -n "$(get os.pretty_name)" ]]; then
+          has_data=true
+          printf "## Operating System\n\n"
+          printf "| Key | Value |\n| --- | --- |\n"
+          printf "| OS | %s |\n" "$(get os.pretty_name)"
+          printf "| Version | %s |\n" "$(get os.version_id)"
+          printf "| Architecture | %s |\n" "$(get os.arch)"
+          printf "| Hostname | %s |\n" "$(get os.hostname)"
+          printf "| User | %s |\n" "$(get os.user)"
+          printf "| Desktop | %s |\n" "$(get os.desktop)"
+          printf "| Shell | %s |\n" "$(get os.shell)"
+          printf "| Terminal | %s |\n" "$(get os.term)"
+        fi
+        ;;
+      CPU)
+        if [[ -n "$(get cpu.model)" ]]; then
+          has_data=true
+          printf "## CPU\n\n"
+          printf "| Key | Value |\n| --- | --- |\n"
+          printf "| Model | %s |\n" "$(get cpu.model)"
+          printf "| Cores | %s logical, %s physical |\n" "$(get cpu.logical)" "$(get cpu.physical_total)"
+          printf "| Frequency | %s MHz |\n" "$(get cpu.mhz)"
+          printf "| Load | %s / %s / %s |\n" "$(get cpu.load_1m)" "$(get cpu.load_5m)" "$(get cpu.load_15m)"
+        fi
+        ;;
+      Memory)
+        if [[ -n "$(get memory.total_kb)" ]]; then
+          has_data=true
+          printf "## Memory\n\n"
+          printf "| Key | Value |\n| --- | --- |\n"
+          printf "| Total | %d MiB |\n" "$(($(get memory.total_kb) / 1024))"
+          printf "| Available | %d MiB |\n" "$(($(get memory.avail_kb) / 1024))"
+          printf "| Free | %d MiB |\n" "$(($(get memory.free_kb) / 1024))"
+          printf "| Swap Total | %d MiB |\n" "$(($(get memory.swap_total_kb) / 1024))"
+        fi
+        ;;
+      Battery)
+        local bc=$(get battery.count)
+        if [[ "$bc" -gt 0 ]]; then
+          has_data=true
+          printf "## Battery\n\n"
+          for ((i=0; i<bc; i++)); do
+            printf "- **%s**: %s%% (%s)\n" "$(get battery.${i}.name)" "$(get battery.${i}.capacity)" "$(get battery.${i}.status)"
+          done
+        fi
+        ;;
+      Fans)
+        local fc=$(get fan.count)
+        if [[ "$fc" -gt 0 ]]; then
+          has_data=true
+          printf "## Fans\n\n"
+          for ((i=0; i<fc; i++)); do
+            printf "- %s: %s RPM\n" "$(get fan.${i}.name)" "$(get fan.${i}.rpm)"
+          done
+        fi
+        ;;
+      Temps)
+        local tc=$(get temp.count)
+        if [[ "$tc" -gt 0 ]]; then
+          has_data=true
+          printf "## Temperatures\n\n"
+          for ((i=0; i<tc; i++)); do
+            printf "- %s: %s°C\n" "$(get temp.${i}.name)" "$(get temp.${i}.celsius)"
+          done
+        fi
+        ;;
+      Network)
+        local nc=$(get net.count)
+        if [[ "$nc" -gt 0 ]]; then
+          has_data=true
+          printf "## Network\n\n"
+          for ((i=0; i<nc; i++)); do
+            printf "- **%s**: %s (%s)\n" "$(get net.${i}.name)" "$(get net.${i}.address)" "$(get net.${i}.state)"
+          done
+        fi
+        ;;
+      Uptime)
+        if [[ -n "$(get uptime.display)" ]]; then
+          has_data=true
+          printf "## Uptime\n\n"
+          printf "%s\n" "$(get uptime.display)"
+        fi
+        ;;
+      Processes)
+        if [[ -n "$(get process.total)" ]]; then
+          has_data=true
+          printf "## Processes\n\n"
+          printf "- Total: %s\n" "$(get process.total)"
+          printf "- Running: %s\n" "$(get process.running)"
+          printf "- Zombie: %s\n" "$(get process.zombie)"
+        fi
+        ;;
+    esac
   done
-  printf "\n---\n*Generated by syslens v%s*\n" "$VERSION"
+
+  # Print any sections not covered above
+  printf "\n---\n*Generated by syslens v%s on %s*\n" "$VERSION" "$(date '+%Y-%m-%d %H:%M:%S')"
 }
 
 export_html() {
-  local style="<style>
-    body{font-family:system-ui,sans-serif;background:#0d1117;color:#c9d1d9;padding:20px;max-width:1000px;margin:auto}
-    h1,h2{color:#58a6ff;border-bottom:1px solid #30363d}
-    table{width:100%;border-collapse:collapse;margin:10px 0}
-    th,td{padding:8px 12px;text-align:left;border-bottom:1px solid #21262d}
-    th{color:#8b949e} tr:hover{background:#161b22}
-    .footer{margin-top:40px;color:#8b949e;font-size:12px;text-align:center}
+  local style="
+  <style>
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #0d1117; color: #c9d1d9; padding: 20px; max-width: 1000px; margin: auto; }
+    h1 { color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 10px; }
+    h2 { color: #58a6ff; margin-top: 30px; border-bottom: 1px solid #21262d; padding-bottom: 5px; }
+    table { width: 100%; border-collapse: collapse; margin: 10px 0; }
+    th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #21262d; }
+    th { color: #8b949e; font-weight: 600; }
+    td { color: #c9d1d9; }
+    tr:hover { background: #161b22; }
+    .footer { margin-top: 40px; color: #8b949e; font-size: 12px; text-align: center; }
+    .warn { color: #d29922; }
+    .err { color: #f85149; }
   </style>"
-  printf "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><title>syslens - %s</title>%s</head><body>\n" "$(get machine.hostname)" "$style"
-  printf "<h1>syslens System Report</h1><p><strong>Host:</strong> %s | <strong>Date:</strong> %s</p>\n" "$(get machine.hostname)" "$(date '+%Y-%m-%d %H:%M:%S')"
+
+  printf "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n"
+  printf "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
+  printf "<title>syslens Report - %s</title>\n" "$(get machine.hostname)"
+  printf "%s\n</head>\n<body>\n" "$style"
+  printf "<h1>🔍 syslens System Report</h1>\n"
+  printf "<p><strong>Host:</strong> %s &nbsp;|&nbsp; <strong>Date:</strong> %s</p>\n" \
+    "$(get machine.hostname)" "$(date '+%Y-%m-%d %H:%M:%S')"
+
   local sections=(
-    "Machine|machine.hostname|Hostname|machine.product|Product|machine.vendor|Vendor"
-    "CPU|cpu.model|Model|cpu.logical|Cores|cpu.mhz|MHz"
-    "Memory|memory.total_kb|Total (KiB)|memory.avail_kb|Available (KiB)"
-    "OS|os.pretty_name|OS|os.version_id|Version|os.arch|Architecture"
-    "Kernel|kernel.release|Release|kernel.version|Version"
+    "Machine||machine.hostname|Hostname|machine.product|Product|machine.vendor|Vendor"
+    "Operating System||os.pretty_name|OS|os.version_id|Version|os.arch|Architecture|os.hostname|Hostname|os.user|User|os.desktop|Desktop|os.shell|Shell"
+    "CPU||cpu.model|Model|cpu.logical|Logical Cores|cpu.physical_total|Physical Cores|cpu.mhz|Frequency (MHz)|cpu.load_1m|Load 1m|cpu.load_5m|Load 5m|cpu.load_15m|Load 15m"
+    "Memory||memory.total_kb|Total (KiB)|memory.avail_kb|Available (KiB)|memory.free_kb|Free (KiB)|memory.swap_total_kb|Swap Total (KiB)"
+    "Kernel||kernel.release|Release|kernel.version|Version|kernel.machine|Architecture|kernel.modules|Modules"
+    "Battery||battery.0.capacity|Capacity %|battery.0.status|Status|battery.0.technology|Technology"
+    "Network||net.default_gateway|Default Gateway"
+    "Security||security.apparmor|AppArmor|security.selinux|SELinux|security.ufw|UFW|security.secure_boot|Secure Boot|security.aslr|ASLR"
+    "Virtualization||virtualization.type|Type|virtualization.is_vm|Is VM?"
+    "Uptime||uptime.display|Uptime"
   )
+
   for entry in "${sections[@]}"; do
-    local title="${entry%%|*}" rest="${entry#*|}" has_data=false rows=""
+    local title="${entry%%||*}"
+    local rest="${entry#*||}"
+    local has_data=false
+    local rows=""
     IFS='|' read -ra fields <<< "$rest"
-    for ((j=0; j<${#fields[@]}; j+=2)); do
-      local fval="$(get "${fields[$j]}")"
-      if [[ -n "$fval" && "$fval" != "0" && "$fval" != "unknown" ]]; then
-        has_data=true; rows+="<tr><td>${fields[$((j+1))]}</td><td>$fval</td></tr>"
+    local row_count=${#fields[@]}
+    for ((j=0; j<row_count; j+=2)); do
+      local fkey="${fields[$j]}"
+      local flabel="${fields[$((j+1))]}"
+      local fval="$(get "$fkey")"
+      if [[ -n "$fval" && "$fval" != "unknown" && "$fval" != "0" && "$fval" != "none" ]]; then
+        has_data=true
+        rows+="<tr><td>$flabel</td><td>$fval</td></tr>\n"
       fi
     done
-    $has_data && printf "<h2>%s</h2>\n<table>\n%s\n</table>\n" "$title" "$rows"
+
+    if $has_data; then
+      printf "<h2>%s</h2>\n<table>\n" "$title"
+      printf "%s" "$rows"
+      printf "</table>\n"
+    fi
   done
-  printf "<div class=\"footer\">Generated by syslens v%s</div>\n</body></html>\n" "$VERSION"
+
+  # Storage
+  local sc=$(get storage.count)
+  if [[ "$sc" -gt 0 ]]; then
+    printf "<h2>Storage</h2>\n<table>\n<tr><th>Device</th><th>Size</th><th>Model</th></tr>\n"
+    for ((i=0; i<sc; i++)); do
+      printf "<tr><td>%s</td><td>%s</td><td>%s</td></tr>\n" \
+        "$(get storage.${i}.name)" "$(get storage.${i}.size)" "$(get storage.${i}.model)"
+    done
+    printf "</table>\n"
+  fi
+
+  # Temperatures
+  local tc=$(get temp.count)
+  if [[ "$tc" -gt 0 ]]; then
+    printf "<h2>Temperatures</h2>\n<table>\n<tr><th>Sensor</th><th>Temperature</th></tr>\n"
+    for ((i=0; i<tc; i++)); do
+      printf "<tr><td>%s</td><td>%s°C</td></tr>\n" \
+        "$(get temp.${i}.name)" "$(get temp.${i}.celsius)"
+    done
+    printf "</table>\n"
+  fi
+
+  # Processes top
+  local topc=$(get process.top_count)
+  if [[ "$topc" -gt 0 ]]; then
+    printf "<h2>Top Processes</h2>\n<table>\n<tr><th>PID</th><th>CPU%</th><th>MEM%</th><th>Command</th></tr>\n"
+    for ((i=0; i<topc; i++)); do
+      printf "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>\n" \
+        "$(get process.top.${i}.pid)" "$(get process.top.${i}.cpu)" \
+        "$(get process.top.${i}.mem)" "$(get process.top.${i}.cmd)"
+    done
+    printf "</table>\n"
+  fi
+
+  printf "<div class=\"footer\">Generated by syslens v%s on %s</div>\n" "$VERSION" "$(date '+%Y-%m-%d %H:%M:%S')"
+  printf "</body>\n</html>\n"
 }
 
-render_all() {
-  render_machine; render_os; render_kernel; render_cpu; render_memory; render_uptime
-  render_gpu; render_storage; render_battery; render_fans; render_temps
-  render_displays; render_motherboard; render_bios
-  render_network; render_audio; render_usb; render_pci
-  render_security; render_virtualization; render_processes; render_system_load
-}
-
-# ── Doctor (Health Diagnostics) ────────────────
+# ──────────────────────────────────────────────
+#  DOCTOR (Health Check)
+# ──────────────────────────────────────────────
 
 cmd_doctor() {
-  collect_all; collect_cpu_load; collect_cpu_usage
+  collect_all_with_usage
   printf "\n${BOLD}${UNDER}syslens Health Report${NC} ${D}v${VERSION}${NC}\n"
   printf "${D}%s${NC}\n" "$(printf "%0.s─" $(seq 1 62))"
+
   local issues=0
-  local t_kb=$(get memory.total_kb) a_kb=$(get memory.avail_kb)
-  if [[ "$t_kb" -gt 0 ]]; then
-    local mp=$(( (t_kb - a_kb) * 100 / t_kb ))
-    if (( mp > 90 )); then printf "${R}✗${NC} Memory critical: %d%%\n" "$mp"; ((issues++))
-    elif (( mp > 75 )); then printf "${Y}⚠${NC} Memory high: %d%%\n" "$mp"; ((issues++))
-    else printf "${G}✓${NC} Memory normal: %d%%\n" "$mp"; fi
+
+  # Memory check
+  local total_kb=$(get memory.total_kb)
+  local avail_kb=$(get memory.avail_kb)
+  if [[ "$total_kb" -gt 0 ]]; then
+    local pct=$(( (total_kb - avail_kb) * 100 / total_kb ))
+    if (( pct > 90 )); then
+      printf "${R}✗${NC} Memory usage critical: %d%%\n" "$pct"
+      ((issues++)) || true
+    elif (( pct > 75 )); then
+      printf "${Y}⚠${NC} Memory usage high: %d%%\n" "$pct"
+      ((issues++)) || true
+    else
+      printf "${G}✓${NC} Memory usage normal: %d%%\n" "$pct"
+    fi
   fi
-  local l1=$(get cpu.load_1m) lc=$(get cpu.logical)
-  if [[ -n "$l1" && -n "$lc" && "$lc" -gt 0 ]] && (( $(bc -l <<< "$l1 > $lc * 0.9" 2>/dev/null || echo 0) )); then
-    printf "${Y}⚠${NC} CPU load high: %s\n" "$l1"; ((issues++))
-  else printf "${G}✓${NC} CPU load normal: %s\n" "$l1"; fi
+
+  # CPU load
+  local load_1m=$(get cpu.load_1m)
+  local logical=$(get cpu.logical)
+  if [[ -n "$load_1m" && -n "$logical" && "$logical" -gt 0 ]]; then
+    if (( $(bc -l <<< "$load_1m > $logical * 0.9" 2>/dev/null || echo 0) )); then
+      printf "${Y}⚠${NC} CPU load high: %s (threshold: %s)\n" "$load_1m" "$logical"
+      ((issues++)) || true
+    else
+      printf "${G}✓${NC} CPU load normal: %s (cores: %s)\n" "$load_1m" "$logical"
+    fi
+  fi
+
+  # Temperature check
   local tc=$(get temp.count)
   for ((i=0; i<tc; i++)); do
-    local c=$(get temp.${i}.celsius) ci=${c%.*} n=$(get temp.${i}.name)
-    if [[ -n "$c" && "$ci" -ge 80 ]]; then printf "${R}✗${NC} Temp critical: %s %s°C\n" "$n" "$c"; ((issues++))
-    elif [[ -n "$c" && "$ci" -ge 60 ]]; then printf "${Y}⚠${NC} Temp high: %s %s°C\n" "$n" "$c"; ((issues++)); fi
+    local celsius=$(get "temp.${i}.celsius")
+    local name=$(get "temp.${i}.name")
+    local cint=${celsius%.*}
+    if [[ -n "$celsius" && "$cint" -ge 80 ]]; then
+      printf "${R}✗${NC} Temperature critical: %s = %s°C\n" "$name" "$celsius"
+      ((issues++)) || true
+    elif [[ -n "$celsius" && "$cint" -ge 60 ]]; then
+      printf "${Y}⚠${NC} Temperature high: %s = %s°C\n" "$name" "$celsius"
+      ((issues++)) || true
+    fi
   done
+
+  # Battery check
   local bc=$(get battery.count)
   for ((i=0; i<bc; i++)); do
-    local cap=$(get battery.${i}.capacity)
-    [[ -n "$cap" && "$cap" -lt 20 ]] && printf "${Y}⚠${NC} Battery critical: %s%%\n" "$cap" && ((issues++))
+    local cap=$(get "battery.${i}.capacity")
+    if [[ -n "$cap" && "$cap" -lt 20 ]]; then
+      printf "${Y}⚠${NC} Battery %s capacity critical: %s%%\n" "$(get battery.${i}.name)" "$cap"
+      ((issues++)) || true
+    elif [[ -n "$cap" && "$cap" -lt 50 ]]; then
+      printf "${Y}⚠${NC} Battery %s capacity low: %s%%\n" "$(get battery.${i}.name)" "$cap"
+      ((issues++)) || true
+    fi
   done
-  local sw_t=$(get memory.swap_total_kb) sw_f=$(get memory.swap_free_kb)
-  if [[ -n "$sw_t" && "$sw_t" -gt 0 ]]; then
-    local sp=$(( (sw_t - sw_f) * 100 / sw_t ))
-    (( sp > 80 )) && printf "${Y}⚠${NC} Swap high: %d%%\n" "$sp" && ((issues++))
+
+  # Swap check
+  local swap_total_kb=$(get memory.swap_total_kb)
+  local swap_free_kb=$(get memory.swap_free_kb)
+  if [[ -n "$swap_total_kb" && "$swap_total_kb" -gt 0 ]]; then
+    local swap_pct=$(( (swap_total_kb - swap_free_kb) * 100 / swap_total_kb ))
+    if (( swap_pct > 80 )); then
+      printf "${Y}⚠${NC} Swap usage high: %d%%\n" "$swap_pct"
+      ((issues++)) || true
+    else
+      printf "${G}✓${NC} Swap usage normal: %d%%\n" "$swap_pct"
+    fi
   fi
-  local fc=$(get fs.count)
-  for ((i=0; i<fc; i++)); do local up=$(get fs.${i}.use_pct) m=$(get fs.${i}.mount)
-    [[ -n "$up" && "$up" -gt 90 ]] && printf "${R}✗${NC} Disk %s critical: %d%%\n" "$m" "$up" && ((issues++))
+
+  # Filesystem checks
+  local fcount=$(get fs.count)
+  for ((i=0; i<fcount; i++)); do
+    local use_pct=$(get "fs.${i}.use_pct")
+    local mount=$(get "fs.${i}.mount")
+    if [[ -n "$use_pct" && "$use_pct" -gt 90 ]]; then
+      printf "${R}✗${NC} Disk %s usage critical: %d%%\n" "$mount" "$use_pct"
+      ((issues++)) || true
+    elif [[ -n "$use_pct" && "$use_pct" -gt 75 ]]; then
+      printf "${Y}⚠${NC} Disk %s usage high: %d%%\n" "$mount" "$use_pct"
+      ((issues++)) || true
+    fi
   done
-  local z=$(get process.zombie); [[ -n "$z" && "$z" -gt 0 ]] && printf "${Y}⚠${NC} Zombie processes: %s\n" "$z" && ((issues++))
-  local dd=$(get uptime.days); [[ -n "$dd" && "$dd" -gt 60 ]] && printf "${Y}⚠${NC} Uptime %sd - consider reboot\n" "$dd" && ((issues++))
-  local aslr=$(get security.aslr); [[ "$aslr" =~ disabled ]] && printf "${R}✗${NC} ASLR disabled!\n" && ((issues++))
+
+  # Zombie processes
+  local zombie=$(get process.zombie)
+  if [[ -n "$zombie" && "$zombie" -gt 0 ]]; then
+    printf "${Y}⚠${NC} Zombie processes: %s\n" "$zombie"
+    ((issues++)) || true
+  fi
+
+  # Uptime
+  local days=$(get uptime.days)
+  if [[ -n "$days" && "$days" -gt 60 ]]; then
+    printf "${Y}⚠${NC} System has been up for %s days - consider rebooting\n" "$days"
+    ((issues++)) || true
+  fi
+
+  # Kernel security
+  local aslr=$(get security.aslr)
+  if [[ "$aslr" =~ disabled ]]; then
+    printf "${R}✗${NC} ASLR is disabled!\n"
+    ((issues++)) || true
+  fi
+
+  local yama=$(get security.ptrace_scope)
+  if [[ -n "$yama" && "$yama" -eq 0 ]]; then
+    printf "${Y}⚠${NC} Ptrace scope is 0 (any process can trace)\n"
+    ((issues++)) || true
+  fi
+
+  # Summary
   printf "${D}%s${NC}\n" "$(printf "%0.s─" $(seq 1 62))"
-  if [[ "$issues" -eq 0 ]]; then printf "${G}✓${NC} System appears healthy\n"
-  else printf "${Y}⚠${NC} %d issue(s) found\n" "$issues"; fi
+  if [[ "$issues" -eq 0 ]]; then
+    printf "${G}✓${NC} All checks passed - system appears healthy\n"
+  else
+    printf "${Y}⚠${NC} %d potential issue(s) found\n" "$issues"
+  fi
   printf "\n"
 }
 
-# ── Snapshot ────────────────────────────────────
-
-SNAPSHOT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/syslens/snapshots"
+# ──────────────────────────────────────────────
+#  SNAPSHOT COMMANDS
+# ──────────────────────────────────────────────
 
 cmd_snapshot_save() {
   mkdir -p "$SNAPSHOT_DIR"
-  collect_all; collect_cpu_load; collect_cpu_usage
-  local ts; ts=$(date '+%Y%m%d_%H%M%S')
-  local file="${SNAPSHOT_DIR}/$(get machine.hostname)_${ts}.json"
+  collect_all_with_usage
+  local timestamp
+  timestamp=$(date '+%Y%m%d_%H%M%S')
+  local hostname=$(get machine.hostname)
+  local file="${SNAPSHOT_DIR}/${hostname}_${timestamp}.json"
   export_json > "$file"
   printf "${G}✓${NC} Snapshot saved: ${B}%s${NC}\n" "$file"
 }
@@ -1007,147 +2030,330 @@ cmd_snapshot_save() {
 cmd_snapshot_list() {
   mkdir -p "$SNAPSHOT_DIR"
   local files=("$SNAPSHOT_DIR"/*.json)
-  [[ ! -f "${files[0]}" ]] && { printf "${Y}No snapshots.${NC}\n"; return; }
+  if [[ ! -e "${files[0]}" ]]; then
+    printf "${Y}No snapshots found.${NC}\n"
+    return
+  fi
+  printf "${BOLD}Saved Snapshots:${NC}\n"
   for f in "${files[@]}"; do
-    local ts="${f#*_}"; ts="${ts%.json}"; ts="${ts/_/ }"
-    printf "  %s  ${D}(%s)${NC}\n" "$ts" "$(du -h "$f" | cut -f1)"
+    local fname="${f##*/}"
+    local host="${fname%_*}"
+    local ts="${fname#*_}"
+    ts="${ts%.json}"
+    ts="${ts/_/ }"
+    local size
+    size=$(du -h "$f" | cut -f1)
+    printf "  ${D}%s${NC}  %s  ${D}(%s)${NC}\n" "$host" "$ts" "$size"
   done
 }
 
 cmd_snapshot_diff() {
-  local target="${1:-}"
   local files=("$SNAPSHOT_DIR"/*.json)
-  [[ ! -f "${files[0]}" ]] && { printf "${R}No snapshots.${NC}\n"; return; }
-  [[ -z "$target" ]] && target="${files[${#files[@]}-1]}"
-  [[ ! -f "$target" ]] && { printf "${R}Not found: %s${NC}\n" "$target"; return; }
-  collect_all; collect_cpu_load; collect_cpu_usage
-  local cur; cur=$(export_json)
-  printf "${BOLD}Diff:${NC} ${D}%s${NC}\n\n" "${target##*/}"
-  python3 -c "
+  if [[ ! -e "${files[0]}" ]]; then
+    printf "${R}No snapshots found.${NC}\n"
+    return
+  fi
+
+  local target=""
+  if [[ -n "${1:-}" ]]; then
+    target="$1"
+  else
+    # Use the latest
+    target="${files[${#files[@]}-1]}"
+  fi
+
+  if [[ ! -f "$target" ]]; then
+    printf "${R}Snapshot not found: %s${NC}\n" "$target"
+    return
+  fi
+
+  printf "${BOLD}Comparing with snapshot:${NC} ${D}%s${NC}\n\n" "${target##*/}"
+
+  # Collect current data
+  collect_all_with_usage
+  local current_json
+  current_json=$(export_json)
+
+  # Compare using python if available
+  if has_cmd python3; then
+    python3 -c "
 import json, sys
-with open('$target') as f: old = json.load(f)
-cur = json.loads('''$cur''')
-def flat(d, p=''):
-    items=[]
-    for k,v in d.items():
-        items.extend(flat(v, p+k+'.') if isinstance(v,dict) else [(p+k,str(v))])
+
+with open('$target') as f:
+    old = json.load(f)
+
+current = json.loads('''$current_json''')
+
+def flatten(d, prefix=''):
+    items = []
+    for k, v in d.items():
+        if isinstance(v, dict):
+            items.extend(flatten(v, prefix + k + '.'))
+        else:
+            items.append((prefix + k, v))
     return items
-o, c = dict(flat(old)), dict(flat(cur))
-ch, ad, rm = 0, 0, 0
-for k in sorted(set(list(o.keys())+list(c.keys()))):
-    ov, cv = o.get(k,'<MISSING>'), c.get(k,'<MISSING>')
-    if ov != cv:
-        if k in o and k not in c: print(f'  REMOVED  {k}'); rm+=1
-        elif k not in o and k in c: print(f'  ADDED    {k}: {cv}'); ad+=1
-        else: print(f'  CHANGED  {k}: {ov} -> {cv}'); ch+=1
-print(f'\n{ch} changed, {ad} added, {rm} removed')
-" 2>/dev/null || warn "Python3 required for diff"
+
+old_flat = dict(flatten(old))
+cur_flat = dict(flatten(current))
+
+changed = 0
+added = 0
+removed = 0
+
+for k in sorted(set(list(old_flat.keys()) + list(cur_flat.keys()))):
+    old_val = old_flat.get(k, '<MISSING>')
+    cur_val = cur_flat.get(k, '<MISSING>')
+    if old_val != cur_val:
+        if k in old_flat and k not in cur_flat:
+            print(f'  REMOVED  {k}: {old_val}')
+            removed += 1
+        elif k not in old_flat and k in cur_flat:
+            print(f'  ADDED    {k}: {cur_val}')
+            added += 1
+        else:
+            print(f'  CHANGED  {k}: {old_val} -> {cur_val}')
+            changed += 1
+
+if changed == 0 and added == 0 and removed == 0:
+    print('  No changes detected.')
+else:
+    print(f'\nSummary: {changed} changed, {added} added, {removed} removed')
+" 2>/dev/null || {
+      warn "Python3 required for diff functionality"
+    }
+  else
+    warn "Python3 required for snapshot comparison"
+  fi
 }
 
-# ── Watch Mode ──────────────────────────────────
+# ──────────────────────────────────────────────
+#  WATCH MODE
+# ──────────────────────────────────────────────
 
 cmd_watch() {
   local interval="${1:-2}"
-  printf "${C}syslens${NC} ${D}watch (every ${interval}s) - Ctrl+C${NC}\n"
+  printf "${C}syslens${NC} ${D}watch mode (every ${interval}s) - Ctrl+C to stop${NC}\n"
   while true; do
+    # Clear screen
     printf "\033[H\033[J"
-    printf "${BOLD}${C}syslens${NC} ${D}watch • %s${NC}\n" "$(date '+%Y-%m-%d %H:%M:%S')"
+    local date_str
+    date_str=$(date '+%Y-%m-%d %H:%M:%S')
+    printf "${BOLD}${C}syslens${NC} ${D}watch • %s${NC}\n" "$date_str"
     printf "${D}%s${NC}\n" "$(printf "%0.s─" $(seq 1 62))"
-    unset SYS; declare -gA SYS
-    collect_all; collect_cpu_load; collect_cpu_usage
-    local model=$(get cpu.model) l1=$(get cpu.load_1m) l5=$(get cpu.load_5m) l15=$(get cpu.load_15m)
-    local usage=$(get cpu.usage_percent) cc=$(get cpu.logical)
-    local us="${D}N/A${NC}"; [[ -n "$usage" ]] && us="${G}${usage}%${NC}"
-    printf "${B}CPU:${NC} %s\n  ${D}Load:${NC} %s %s %s  ${D}Usage:${NC} %s  ${D}Cores:${NC} %s\n" "$model" "$l1" "$l5" "$l15" "$us" "$cc"
-    local tm=$(($(get memory.total_kb)/1024)) am=$(($(get memory.avail_kb)/1024)) um=$((tm-am)) pm=$(( (tm-am)*100/tm ))
-    local bl=25 fl=$((pm*bl/100)) bar="[${G}"; for ((i=0;i<fl;i++)); do bar+="█"; done
-    bar+="${D}"; for ((i=0;i<bl-fl;i++)); do bar+="░"; done; bar+="${NC}]"
-    printf "${B}MEM:${NC} %s %s/%s MiB (%d%%)\n" "$bar" "$um" "$tm" "$pm"
-    printf "${B}FS:${NC} "
-    local fcount=$(get fs.count) shown=0
-    for ((i=0; i<fcount; i++)); do
-      local m=$(get fs.${i}.mount) p=$(get fs.${i}.use_pct)
-      [[ "$m" != "/" && "$m" != "/home" && "$m" != "/boot" ]] && continue
-      local col=$G; (( p > 90 )) && col=$R; (( p >= 75 && p <= 90 )) && col=$Y
-      printf "${col}%s %s%%${NC}  " "$m" "$p"; ((shown++)) || true
-    done; (( shown == 0 )) && printf "${D}N/A${NC}"; printf "\n"
-    printf "${B}TEMP:${NC} " 
-    local tc=$(get temp.count); shown=0
-    for ((i=0; i<tc; i++)); do
-      local n=$(get temp.${i}.name) c=$(get temp.${i}.celsius) ci=${c%.*}
-      echo "$n" | grep -qiE "cpu|core|package|pch|soc|gpu" || continue
-      local col=$G; (( ci >= 80 )) && col=$R; (( ci >= 60 && ci < 80 )) && col=$Y
-      printf "${col}%s %s°C${NC}  " "$n" "$c"; ((shown++)) || true
-    done; (( shown == 0 )) && printf "${D}N/A${NC}"; printf "\n"
-    printf "${B}UP:${NC} %s\n" "$(get uptime.display)"
+
+    unset SYS
+    declare -gA SYS
+    collect_all_with_usage
+
+    # Render compact view
+    render_cpu_compact
+    render_memory_compact
+    render_storage_compact
+    render_temps_compact
+    render_uptime_compact
+
     printf "${D}%s${NC}\n" "$(printf "%0.s─" $(seq 1 62))"
     sleep "$interval"
   done
 }
 
-# ── Main CLI ────────────────────────────────────
+render_cpu_compact() {
+  local model=$(get cpu.model)
+  local load1=$(get cpu.load_1m)
+  local load5=$(get cpu.load_5m)
+  local load15=$(get cpu.load_15m)
+  local usage=$(get cpu.usage_percent)
+
+  local usage_str="" usage_col=$G
+  if [[ -n "$usage" ]]; then
+    (( usage > 80 )) && usage_col=$R
+    (( usage >= 50 && usage <= 80 )) && usage_col=$Y
+    usage_str="${usage_col}${usage}%${NC}"
+  else
+    usage_str="${D}N/A${NC}"
+  fi
+
+  printf "${B}CPU:${NC} %s\n" "$model"
+  printf "  ${D}Load:${NC} %s %s %s  ${D}Usage:${NC} %s  ${D}Cores:${NC} %s\n" \
+    "$load1" "$load5" "$load15" "$usage_str" "$(get cpu.logical)"
+}
+
+render_memory_compact() {
+  local total_mib=$(($(get memory.total_kb) / 1024))
+  local avail_mib=$(($(get memory.avail_kb) / 1024))
+  local used_mib=$((total_mib - avail_mib))
+  local pct=$(( (total_mib - avail_mib) * 100 / total_mib ))
+
+  local bar_len=25
+  local filled=$(( pct * bar_len / 100 ))
+  local bar="["
+  local col=$G
+  (( pct > 80 )) && col=$R
+  (( pct >= 50 && pct <= 80 )) && col=$Y
+  bar+="$col"
+  for ((i=0; i<filled; i++)); do bar+="█"; done
+  bar+="$D"
+  for ((i=0; i<bar_len-filled; i++)); do bar+="░"; done
+  bar+="$NC]"
+  printf "${B}MEM:${NC} %s %s/%s MiB (%d%%)\n" "$bar" "$used_mib" "$total_mib" "$pct"
+}
+
+render_storage_compact() {
+  local fcount=$(get fs.count)
+  printf "${B}FS:${NC} "
+  local shown=0
+  for ((i=0; i<fcount; i++)); do
+    local mount=$(get "fs.${i}.mount")
+    local use_pct=$(get "fs.${i}.use_pct")
+    [[ "$mount" == "/" || "$mount" == "/home" || "$mount" == "/boot" ]] || continue
+    local col=$G
+    (( use_pct > 90 )) && col=$R
+    (( use_pct >= 75 && use_pct <= 90 )) && col=$Y
+    printf "${col}%s %s%%${NC}  " "$mount" "$use_pct"
+    ((shown++)) || true
+  done
+  (( shown == 0 )) && printf "${D}N/A${NC}"
+  printf "\n"
+}
+
+render_temps_compact() {
+  local tc=$(get temp.count)
+  printf "${B}TEMP:${NC} "
+  local shown=0
+  for ((i=0; i<tc; i++)); do
+    local name=$(get "temp.${i}.name")
+    local celsius=$(get "temp.${i}.celsius")
+    local cint=${celsius%.*}
+    local col=$G
+    (( cint >= 80 )) && col=$R
+    (( cint >= 60 && cint < 80 )) && col=$Y
+    # Show only relevant sensors
+    if echo "$name" | grep -qiE "cpu|core|package|pch|soc|gpu"; then
+      printf "${col}%s %s°C${NC}  " "$name" "$celsius"
+      ((shown++)) || true
+    fi
+  done
+  (( shown == 0 )) && printf "${D}N/A${NC}"
+  printf "\n"
+}
+
+render_uptime_compact() {
+  printf "${B}UP:${NC} %s\n" "$(get uptime.display)"
+}
+
+# ──────────────────────────────────────────────
+#  CLI PARSER
+# ──────────────────────────────────────────────
 
 usage() {
   cat <<EOF
 ${BOLD}${C}syslens${NC} ${D}v${VERSION}${NC} — Linux System Inspection & Diagnostics
 
-${BOLD}Usage:${NC}  ${B}syslens${NC} [command] [options]
+${BOLD}Usage:${NC}
+  ${B}syslens${NC} [command] [options]
 
 ${BOLD}Commands:${NC}
-  ${G}syslens${NC}           Show all system information
-  ${G}syslens <section>${NC} Show section: cpu memory os kernel machine uptime gpu storage battery fans temps displays motherboard bios network audio usb pci security virt processes
-  ${G}syslens doctor${NC}    Run health diagnostics
-  ${G}syslens watch${NC} [s] Live monitoring (default 2s)
-  ${G}syslens snapshot${NC}  save|list|diff snapshots
-  ${G}syslens help${NC}      Show this help
+  ${G}syslens${NC}                    Show all system information (default)
+  ${G}syslens <section>${NC}         Show a specific section:
+                  machine  cpu  gpu  memory  storage  battery  fans
+                  temps  displays  motherboard  bios  network  audio
+                  usb  pci  os  kernel  security  virt  uptime  processes
+  ${G}syslens doctor${NC}            Run health diagnostics
+  ${G}syslens watch${NC} [interval]  Live monitoring mode (default 2s)
+  ${G}syslens snapshot save${NC}     Save system snapshot
+  ${G}syslens snapshot list${NC}     List saved snapshots
+  ${G}syslens snapshot diff${NC} [f] Compare with snapshot
+  ${G}syslens help${NC}              Show this help message
 
 ${BOLD}Options:${NC}
-  ${D}--json${NC}            JSON output
-  ${D}--yaml${NC}            YAML output
-  ${D}--markdown${NC}        Markdown output
-  ${D}--html${NC}            HTML output
-  ${D}--no-color${NC}        Disable color
-  ${D}--version${NC}         Show version
+  ${D}--json${NC}                    Output as JSON
+  ${D}--yaml${NC}                    Output as YAML
+  ${D}--markdown${NC}                Output as Markdown
+  ${D}--html${NC}                    Output as HTML
+  ${D}--no-color${NC}                Disable color output
+  ${D}--version${NC}                 Show version
+
+${BOLD}Examples:${NC}
+  syslens                            Show everything
+  syslens cpu                        CPU info only
+  syslens --json                     Full system info as JSON
+  syslens doctor                     Health check
+  syslens watch 5                    Watch every 5 seconds
+  syslens snapshot save              Take a snapshot
+  syslens snapshot diff              Compare with latest
+
+${D}Report bugs and contribute at https://github.com/your-org/syslens${NC}
 EOF
   exit 0
 }
 
+version_info() {
+  printf "syslens v%s\n" "$VERSION"
+  printf "Linux System Inspection & Diagnostics Tool\n"
+  exit 0
+}
+
+# ──────────────────────────────────────────────
+#  MAIN
+# ──────────────────────────────────────────────
+
 main() {
-  local format="terminal" cmd="" args=()
+  local format="terminal"
+  local cmd=""
+  local args=()
+
   for arg in "$@"; do
     case "$arg" in
-      --json) format="json" ;; --yaml) format="yaml" ;;
-      --markdown) format="markdown" ;; --html) format="html" ;;
-      --no-color) NO_COLOR=1 ;; --version) echo "syslens v$VERSION"; exit 0 ;;
+      --json) format="json" ;;
+      --yaml) format="yaml" ;;
+      --markdown) format="markdown" ;;
+      --html) format="html" ;;
+      --no-color) NO_COLOR=1 ;;
+      --version) version_info ;;
       --help|help|-h) usage ;;
       *) args+=("$arg") ;;
     esac
   done
+
   cmd="${args[0]:-}"
+  local arg1="${args[1]:-}"
+  local arg2="${args[2]:-}"
+
   if [[ -n "$cmd" ]]; then
     case "$cmd" in
-      doctor) collect_all; collect_cpu_load; collect_cpu_usage; cmd_doctor; return ;;
-      watch) cmd_watch "${args[1]:-2}"; return ;;
+      doctor) collect_all_with_usage; cmd_doctor; return ;;
+      watch)
+        cmd_watch "${arg1:-2}"
+        return
+        ;;
       snapshot)
-        case "${args[1]:-}" in
+        case "${arg1:-}" in
           save) cmd_snapshot_save; return ;;
           list) cmd_snapshot_list; return ;;
-          diff) cmd_snapshot_diff "${args[2]:-}"; return ;;
-          *) echo "Usage: syslens snapshot save|list|diff [file]"; return ;;
-        esac ;;
-      cpu) collect_all; collect_cpu_load; collect_cpu_usage; render_cpu; return ;;
-      machine|memory|os|kernel|uptime|gpu|storage|battery|fans|temps|displays|motherboard|bios|network|audio|usb|pci|security|virt|processes)
-        collect_all; collect_cpu_load; "render_$cmd"; return ;;
-      *) echo "Unknown: $cmd"; usage ;;
+          diff) cmd_snapshot_diff "${arg2:-}"; return ;;
+          *) echo "Unknown snapshot subcommand: ${arg1:-}"; usage ;;
+        esac
+        return
+        ;;
+      machine|cpu|gpu|memory|storage|battery|fans|temps|displays|motherboard|bios|network|audio|usb|pci|os|kernel|security|virt|uptime|processes)
+        collect_all
+        collect_cpu_usage
+        "render_$cmd"
+        return
+        ;;
+      *)
+        echo "Unknown command: $cmd"; usage ;;
     esac
   fi
-  collect_all
+
+  collect_all_with_usage
+
   case "$format" in
-    json) export_json ;;
-    yaml) export_yaml ;;
+    json)     export_json ;;
+    yaml)     export_yaml ;;
     markdown) export_markdown ;;
-    html) export_html ;;
-    *) render_all ;;
+    html)     export_html ;;
+    *)        render_all ;;
   esac
 }
 
