@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# syslens - Linux System Inspection & Diagnostics Tool
+#
+# A fast, modular, cross-distribution system inspector that gathers
+# comprehensive hardware, OS, and runtime information from /proc, /sys,
+# and kernel interfaces before falling back to external utilities.
+
+set -uo pipefail
+IFS=$'\n\t'
+
+VERSION="0.1.0"
+export LC_ALL=C
+
+# Colors
+if [[ -t 1 ]] && [[ "${NO_COLOR:-}" != "1" ]]; then
+  R="\033[1;31m"    G="\033[1;32m"    Y="\033[1;33m"
+  B="\033[1;34m"    M="\033[1;35m"    C="\033[1;36m"
+  W="\033[1;37m"    D="\033[0;37m"    NC="\033[0m"
+  BOLD="\033[1m"    UNDER="\033[4m"
+else
+  R= G= Y= B= M= C= W= D= NC= BOLD= UNDER=
+fi
+
+# Box-drawing characters
+H_LINE="─" V_LINE="│" TL="┌" TR="┐" BL="└" BR="┘"
+TEE_DN="┬" TEE_UP="┴" TEE_LT="├" TEE_RT="┤" CROSS="┼"
+
+die() { printf "${R}Error:${NC} %s\n" "$*" >&2; exit 1; }
+warn() { printf "${Y}Warning:${NC} %s\n" "$*" >&2; }
+
+safe_read() {
+  local f="$1"
+  if [[ -r "$f" ]]; then <"$f" tr -d '\0' 2>/dev/null || true; fi
+}
+safe_read_line() {
+  safe_read "$1" | head -n1 | tr -d '[:space:]' || true
+}
+has_cmd() { command -v "$1" &>/dev/null; }
+
+# Data store
+declare -A SYS=()
+store() { SYS["$1"]="$2"; }
+get() { echo "${SYS[$1]-}"; }
+
+# ── Collectors ──────────────────────────────────
+
+collect_machine() {
+  store "machine.hostname" "$(hostname 2>/dev/null || uname -n)"
+  if [[ -f /sys/devices/virtual/dmi/id/product_name ]]; then
+    store "machine.product" "$(safe_read_line /sys/devices/virtual/dmi/id/product_name)"
+    store "machine.vendor" "$(safe_read_line /sys/devices/virtual/dmi/id/sys_vendor)"
+  fi
+}
+
+collect_cpu() {
+  local cpuinfo
+  cpuinfo=$(safe_read /proc/cpuinfo) || true
+  if [[ -z "$cpuinfo" ]]; then
+    has_cmd lscpu && while IFS=':' read -r key val; do
+      key="${key// /_}"; key="${key,,}"; val="${val## }"
+      case "$key" in
+        model_name) store "cpu.model" "$val" ;;
+        vendor_id) store "cpu.vendor" "$val" ;;
+      esac
+    done < <(lscpu 2>/dev/null)
+  else
+    while IFS=':' read -r key val; do
+      key="${key#"${key%%[![:space:]]*}"}"
+      key="${key%"${key##*[![:space:]]}"}"
+      val="${val## }"
+      case "$key" in
+        "model name") store "cpu.model" "$val" ;;
+        vendor_id) store "cpu.vendor" "$val" ;;
+        flags) store "cpu.flags" "$val" ;;
+        "cpu cores") store "cpu.cores" "$val" ;;
+      esac
+    done <<< "$cpuinfo"
+  fi
+  local cc; cc=$(grep -c "^processor" /proc/cpuinfo 2>/dev/null || echo "0")
+  store "cpu.logical" "$cc"
+}
+
+collect_memory() {
+  local meminfo; meminfo=$(safe_read /proc/meminfo) || true
+  if [[ -n "$meminfo" ]]; then
+    while IFS=':' read -r key val; do
+      val="${val## }"; val="${val% kB}"
+      case "$key" in
+        MemTotal) store "memory.total_kb" "$val" ;;
+        MemFree) store "memory.free_kb" "$val" ;;
+        MemAvailable) store "memory.avail_kb" "$val" ;;
+        SwapTotal) store "memory.swap_total_kb" "$val" ;;
+        SwapFree) store "memory.swap_free_kb" "$val" ;;
+      esac
+    done <<< "$meminfo"
+  fi
+}
+
+collect_os() {
+  if [[ -f /etc/os-release ]]; then
+    while IFS='=' read -r key val; do
+      val="${val%\"}"; val="${val#\"}"
+      case "$key" in
+        PRETTY_NAME) store "os.pretty_name" "$val" ;;
+        ID) store "os.id" "$val" ;;
+        VERSION_ID) store "os.version_id" "$val" ;;
+      esac
+    done < /etc/os-release
+  fi
+  store "os.arch" "$(uname -m)"
+  store "os.user" "$(whoami 2>/dev/null || id -un)"
+}
+
+collect_kernel() {
+  store "kernel.release" "$(uname -r)"
+  store "kernel.version" "$(uname -v)"
+  store "kernel.machine" "$(uname -m)"
+}
+
+collect_uptime() {
+  local secs; secs=$(safe_read_line /proc/uptime 2>/dev/null | awk '{print $1}' | cut -d. -f1) || true
+  if [[ -n "$secs" ]]; then
+    local d=$((secs/86400)) h=$(((secs%86400)/3600)) m=$(((secs%3600)/60)) s=$((secs%60))
+    store "uptime.seconds" "$secs"
+    store "uptime.display" "${d}d ${h}h ${m}m ${s}s"
+  fi
+}
+
+collect_all() {
+  collect_machine; collect_cpu; collect_memory; collect_os; collect_kernel; collect_uptime
+}
+
+# ── Terminal output ─────────────────────────────
+
+section() {
+  local title="$1" color="${2:-$B}" len=60
+  local pad=$(( (len - ${#title} - 2) / 2 ))
+  local left=$pad right=$(( len - ${#title} - 2 - pad ))
+  printf "\n${color}${BOLD}%s" "$TL"
+  printf "%0.s${H_LINE}" $(seq 1 $left)
+  printf " %s " "$title"
+  printf "%0.s${H_LINE}" $(seq 1 $right)
+  printf "%s${NC}\n" "$TR"
+}
+
+kv() { local k="$1" v="$2" c="${3:-$NC}"; printf "${D}${V_LINE}${NC} ${BOLD}%-20s${NC} ${c}%s${NC}\n" "$k:" "$v"; }
+section_end() { printf "${D}%s${NC}\n" "${BL}$(printf "%0.s${H_LINE}" $(seq 1 62))${BR}"; }
+
+render_machine() {
+  section "Machine"
+  kv "Hostname" "$(get machine.hostname)" "$G"
+  kv "Product" "$(get machine.product)"
+  kv "Vendor" "$(get machine.vendor)"
+  section_end
+}
+
+render_cpu() {
+  section "CPU"
+  kv "Model" "$(get cpu.model)" "$G"
+  kv "Vendor" "$(get cpu.vendor)"
+  kv "Cores" "$(get cpu.logical)"
+  section_end
+}
+
+render_memory() {
+  section "Memory"
+  local t=$(($(get memory.total_kb)/1024)) a=$(($(get memory.avail_kb)/1024))
+  kv "Total" "${t} MiB"
+  kv "Available" "${a} MiB"
+  if [[ "$t" -gt 0 ]]; then
+    local pct=$(( (t-a)*100/t )) bar_len=30 filled=$((pct*bar_len/100))
+    local bar="[${G}"; for ((i=0;i<filled;i++)); do bar+="█"; done
+    bar+="${D}"; for ((i=0;i<bar_len-filled;i++)); do bar+="░"; done
+    bar+="${NC}] ${pct}%"
+    kv "Usage" "$bar"
+  fi
+  section_end
+}
+
+render_os() {
+  section "Operating System"
+  kv "OS" "$(get os.pretty_name)" "$G"
+  kv "Version" "$(get os.version_id)"
+  kv "Architecture" "$(get os.arch)"
+  kv "User" "$(get os.user)"
+  section_end
+}
+
+render_kernel() {
+  section "Kernel"
+  kv "Release" "$(get kernel.release)" "$G"
+  kv "Version" "$(get kernel.version)"
+  section_end
+}
+
+render_uptime() {
+  section "Uptime"
+  kv "Uptime" "$(get uptime.display)"
+  section_end
+}
+
+render_all() { render_machine; render_os; render_kernel; render_cpu; render_memory; render_uptime; }
+
+# ── Main CLI ────────────────────────────────────
+
+usage() {
+  cat <<EOF
+${BOLD}${C}syslens${NC} ${D}v${VERSION}${NC} — Linux System Inspection & Diagnostics
+
+${BOLD}Usage:${NC}  ${B}syslens${NC} [command] [options]
+
+${BOLD}Commands:${NC}
+  ${G}syslens${NC}           Show all system information
+  ${G}syslens <section>${NC} Show section: cpu memory os kernel machine uptime
+  ${G}syslens doctor${NC}    Run health diagnostics
+  ${G}syslens help${NC}      Show this help
+
+${BOLD}Options:${NC}
+  ${D}--json${NC}            JSON output
+  ${D}--yaml${NC}            YAML output
+  ${D}--markdown${NC}        Markdown output
+  ${D}--html${NC}            HTML output
+  ${D}--no-color${NC}        Disable color
+  ${D}--version${NC}         Show version
+EOF
+  exit 0
+}
+
+main() {
+  local format="terminal" cmd="" args=()
+  for arg in "$@"; do
+    case "$arg" in
+      --json) format="json" ;; --yaml) format="yaml" ;;
+      --markdown) format="markdown" ;; --html) format="html" ;;
+      --no-color) NO_COLOR=1 ;; --version) echo "syslens v$VERSION"; exit 0 ;;
+      --help|help|-h) usage ;;
+      *) args+=("$arg") ;;
+    esac
+  done
+  cmd="${args[0]:-}"
+  if [[ -n "$cmd" ]]; then
+    case "$cmd" in
+      doctor|watch|snapshot) echo "Coming in next commit."; return ;;
+      machine|cpu|memory|os|kernel|uptime)
+        collect_all; "render_$cmd"; return ;;
+      *) echo "Unknown: $cmd"; usage ;;
+    esac
+  fi
+  collect_all
+  case "$format" in
+    json) python3 -c "import json; d={}; print(d)" ;;
+    yaml) echo "YAML coming soon" ;;
+    markdown) echo "# syslens Report" ;;
+    html) echo "<html><body><h1>syslens</h1></body></html>" ;;
+    *) render_all ;;
+  esac
+}
+
+main "$@"
