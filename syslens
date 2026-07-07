@@ -87,6 +87,7 @@ collect_cpu() {
   fi
   local cc; cc=$(grep -c "^processor" /proc/cpuinfo 2>/dev/null || echo "0")
   store "cpu.logical" "$cc"
+  store "cpu.arch" "$(uname -m)"
 }
 
 collect_memory() {
@@ -321,7 +322,8 @@ collect_all() {
   collect_gpu; collect_storage; collect_battery; collect_fans; collect_temps
   collect_displays; collect_motherboard; collect_bios
   collect_network; collect_audio; collect_usb; collect_pci
-}
+  collect_security; collect_virtualization; collect_processes; collect_system_load
+  collect_cpu_load
 
 # -- Network --
 collect_network() {
@@ -412,6 +414,115 @@ collect_pci() {
     done < <(lspci 2>/dev/null || true)
     store "pci.count" "$idx"
   fi
+}
+
+# -- Security --
+collect_security() {
+  if [[ -d /sys/kernel/security/apparmor ]]; then
+    store "security.apparmor" "enabled"
+    store "security.apparmor_profiles" "$(cat /sys/kernel/security/apparmor/profiles 2>/dev/null | wc -l)"
+  else
+    store "security.apparmor" "disabled"
+  fi
+  if has_cmd getenforce; then store "security.selinux" "$(getenforce 2>/dev/null)"
+  else store "security.selinux" "not_present"; fi
+  if [[ -f /proc/sys/kernel/randomize_va_space ]]; then
+    local aslr; aslr=$(safe_read_line /proc/sys/kernel/randomize_va_space)
+    case "$aslr" in
+      0) store "security.aslr" "disabled" ;;
+      1) store "security.aslr" "partial" ;;
+      2) store "security.aslr" "full" ;;
+    esac
+  fi
+  if [[ -f /proc/sys/kernel/yama/ptrace_scope ]]; then
+    store "security.ptrace_scope" "$(safe_read_line /proc/sys/kernel/yama/ptrace_scope)"
+  fi
+  if has_cmd ufw; then store "security.ufw" "$(ufw status 2>/dev/null | head -1)"; fi
+  local sb_file; sb_file=$(ls /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | head -1) || true
+  if [[ -n "$sb_file" && -f "$sb_file" ]]; then
+    local sb; sb=$(od -An -t u1 "$sb_file" 2>/dev/null | head -1 | awk '{print $2}')
+    store "security.secure_boot" "$( [[ "$sb" == "1" ]] && echo "enabled" || echo "disabled" )"
+  else
+    store "security.secure_boot" "N/A"
+  fi
+}
+
+# -- Virtualization --
+collect_virtualization() {
+  local virt=""
+  if has_cmd systemd-detect-virt; then
+    local sdv; sdv=$(systemd-detect-virt 2>/dev/null || echo "none")
+    [[ "$sdv" != "none" ]] && virt="$sdv"
+  fi
+  if [[ -z "$virt" && -f /sys/devices/virtual/dmi/id/product_name ]]; then
+    local prod; prod=$(safe_read_line /sys/devices/virtual/dmi/id/product_name)
+    case "$prod" in *VMware*) virt="VMware" ;; *VirtualBox*) virt="VirtualBox" ;; *KVM*|*QEMU*) virt="KVM/QEMU" ;; *Xen*) virt="Xen" ;; esac
+  fi
+  if [[ -z "$virt" ]]; then
+    local cpuinfo; cpuinfo=$(safe_read /proc/cpuinfo)
+    echo "$cpuinfo" | grep -qi "hypervisor" && virt="hypervisor"
+  fi
+  store "virtualization.type" "${virt:-none}"
+  store "virtualization.is_vm" "$( [[ -n "$virt" ]] && echo "yes" || echo "no" )"
+}
+
+# -- Processes --
+collect_processes() {
+  store "process.total" "$(ps -e 2>/dev/null | wc -l | awk '{print $1-1}')"
+  store "process.running" "$(ps -e -o state= 2>/dev/null | grep -c "^R" || echo "0")"
+  store "process.sleeping" "$(ps -e -o state= 2>/dev/null | grep -c "^S" || echo "0")"
+  store "process.zombie" "$(ps -e -o state= 2>/dev/null | grep -c "^Z" || echo "0")"
+  store "process.stopped" "$(ps -e -o state= 2>/dev/null | grep -c "^T" || echo "0")"
+  local top_idx=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local pid cpu mem cmd
+    pid=$(echo "$line" | awk '{print $1}')
+    cpu=$(echo "$line" | awk '{print $3}')
+    mem=$(echo "$line" | awk '{print $4}')
+    cmd=$(echo "$line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}' | xargs | head -c 55)
+    [[ "$top_idx" -ge 10 ]] && break
+    store "process.top.${top_idx}.pid" "$pid"
+    store "process.top.${top_idx}.cpu" "$cpu"
+    store "process.top.${top_idx}.mem" "$mem"
+    store "process.top.${top_idx}.cmd" "$cmd"
+    ((top_idx++)) || true
+  done < <(ps -eo pid,ppid,%cpu,%mem,rss,args --sort=-%cpu 2>/dev/null | tail -n +2 | head -10)
+  store "process.top_count" "$top_idx"
+}
+
+# -- System load --
+collect_system_load() {
+  store "system.fd_count" "$(ls /proc/*/fd 2>/dev/null | wc -l || echo "0")"
+  store "system.users" "$(users | wc -w)"
+  if has_cmd systemctl; then
+    store "system.services_running" "$(systemctl list-units --type=service --state=running 2>/dev/null | grep -c "running" || echo "0")"
+  fi
+}
+
+# -- CPU load averages --
+collect_cpu_load() {
+  local loadavg; loadavg=$(< /proc/loadavg) 2>/dev/null || true
+  store "cpu.load_1m" "$(echo "${loadavg:-}" | awk '{print $1}')"
+  store "cpu.load_5m" "$(echo "${loadavg:-}" | awk '{print $2}')"
+  store "cpu.load_15m" "$(echo "${loadavg:-}" | awk '{print $3}')"
+  # Per-core frequencies
+  if [[ -d /sys/devices/system/cpu ]]; then
+    local idx=0
+    for cpuf in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq; do
+      if [[ -r "$cpuf" ]]; then
+        local freq=$(< "$cpuf"); freq=$((freq / 1000))
+        store "cpu.core.${idx}.freq" "$freq"; ((idx++)) || true
+      fi
+    done
+    store "cpu.core_count" "$idx"
+  fi
+  # Physical cores
+  local phys=0
+  [[ -d /sys/devices/system/cpu ]] && for dir in /sys/devices/system/cpu/cpu[0-9]*/topology/core_id; do
+    [[ -r "$dir" ]] || continue; phys=$((phys + 1))
+  done 2>/dev/null || true
+  store "cpu.physical_total" "$phys"
 }
 
 # ── CPU usage (needs brief sleep) ──────────────
@@ -682,11 +793,59 @@ render_pci() {
   section_end
 }
 
+render_security() {
+  section "Security"
+  local aa=$(get security.apparmor) se=$(get security.selinux) ufw=$(get security.ufw)
+  local sb=$(get security.secure_boot) aslr=$(get security.aslr)
+  [[ -n "$aa" ]] && kv "AppArmor" "$aa" "$( [[ "$aa" == "enabled" ]] && echo "$G" || echo "$R" )"
+  [[ -n "$se" ]] && kv "SELinux" "$se" "$D"
+  [[ -n "$ufw" ]] && kv "UFW" "$ufw" "$( [[ "$ufw" == "active" ]] && echo "$G" || echo "$Y" )"
+  [[ -n "$sb" ]] && kv "Secure Boot" "$sb"
+  [[ -n "$aslr" ]] && kv "ASLR" "$aslr"
+  local yama=$(get security.ptrace_scope); [[ -n "$yama" ]] && kv "Ptrace Scope" "$yama"
+  section_end
+}
+
+render_virtualization() {
+  local virt=$(get virtualization.type) is_vm=$(get virtualization.is_vm)
+  [[ "$virt" == "none" ]] && return
+  section "Virtualization"
+  kv "Type" "$( [[ "$is_vm" == "yes" ]] && echo "${Y}${virt}${NC}" || echo "$virt" )"
+  section_end
+}
+
+render_processes() {
+  section "Processes"
+  kv "Total" "$(get process.total)"
+  kv "Running" "$(get process.running)" "$G"
+  kv "Sleeping" "$(get process.sleeping)" "$D"
+  local z=$(get process.zombie); [[ -n "$z" && "$z" -gt 0 ]] && kv "Zombie" "${R}${z}${NC}" "$R"
+  kv "Stopped" "$(get process.stopped)"
+  local tc=$(get process.top_count)
+  if [[ "$tc" -gt 0 ]]; then
+    printf "${D}${V_LINE}  %6s %5s %5s %s${NC}\n" "PID" "CPU%" "MEM%" "Command"
+    for ((i=0; i<tc; i++)); do
+      printf "${D}${V_LINE}${NC}  %6s %4s%% %4s%% %s\n" "$(get process.top.${i}.pid)" \
+        "$(get process.top.${i}.cpu)" "$(get process.top.${i}.mem)" "$(get process.top.${i}.cmd)"
+    done
+  fi
+  section_end
+}
+
+render_system_load() {
+  section "System Load"
+  kv "Fds" "$(get system.fd_count)"
+  kv "Users" "$(get system.users)"
+  kv "Services" "$(get system.services_running)"
+  section_end
+}
+
 render_all() {
   render_machine; render_os; render_kernel; render_cpu; render_memory; render_uptime
   render_gpu; render_storage; render_battery; render_fans; render_temps
   render_displays; render_motherboard; render_bios
   render_network; render_audio; render_usb; render_pci
+  render_security; render_virtualization; render_processes; render_system_load
 }
 
 # ── Main CLI ────────────────────────────────────
@@ -699,7 +858,7 @@ ${BOLD}Usage:${NC}  ${B}syslens${NC} [command] [options]
 
 ${BOLD}Commands:${NC}
   ${G}syslens${NC}           Show all system information
-  ${G}syslens <section>${NC} Show section: cpu memory os kernel machine uptime gpu storage battery fans temps displays motherboard bios network audio usb pci
+  ${G}syslens <section>${NC} Show section: cpu memory os kernel machine uptime gpu storage battery fans temps displays motherboard bios network audio usb pci security virt processes
   ${G}syslens doctor${NC}    Run health diagnostics
   ${G}syslens help${NC}      Show this help
 
@@ -729,8 +888,9 @@ main() {
   if [[ -n "$cmd" ]]; then
     case "$cmd" in
       doctor|watch|snapshot) echo "Coming in next commit."; return ;;
-      machine|cpu|memory|os|kernel|uptime|gpu|storage|battery|fans|temps|displays|motherboard|bios|network|audio|usb|pci)
-        collect_all; "render_$cmd"; return ;;
+      cpu) collect_all; collect_cpu_load; collect_cpu_usage; render_cpu; return ;;
+      machine|memory|os|kernel|uptime|gpu|storage|battery|fans|temps|displays|motherboard|bios|network|audio|usb|pci|security|virt|processes)
+        collect_all; collect_cpu_load; "render_$cmd"; return ;;
       *) echo "Unknown: $cmd"; usage ;;
     esac
   fi
