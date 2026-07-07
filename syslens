@@ -85,35 +85,21 @@ safe_read_line() {
 # Check if a command exists
 has_cmd() { command -v "$1" &>/dev/null; }
 
-# Convert value to human-readable size (KiB input)
-fmt_size() {
-  local val=$1
-  local unit="${2:-K}"
-  local factor=1024
-  if [[ "$unit" == "K" ]]; then
-    if (( val >= 1073741824 )); then
-      printf "%.2f TiB" "$(bc -l <<< "$val / 1099511627776" 2>/dev/null || echo "$val/1099511627776")"
-    elif (( val >= 1048576 )); then
-      printf "%.2f GiB" "$(bc -l <<< "$val / 1073741824" 2>/dev/null || echo "$val/1073741824")"
-    elif (( val >= 1024 )); then
-      printf "%.2f MiB" "$(bc -l <<< "$val / 1048576" 2>/dev/null || echo "$val/1048576")"
-    else
-      printf "%d KiB" "$val"
-    fi
-  fi
-}
-
-# Convert bytes to human
+# Convert bytes to human-readable (no bc needed)
 fmt_size_bytes() {
   local val=$1
   if (( val >= 1099511627776 )); then
-    printf "%.2f TiB" "$(bc -l <<< "$val / 1099511627776" 2>/dev/null || true)"
+    local i=$((val / 1099511627776)) f=$(((val % 1099511627776) * 100 / 1099511627776))
+    printf "%d.%02d TiB" "$i" "$f"
   elif (( val >= 1073741824 )); then
-    printf "%.2f GiB" "$(bc -l <<< "$val / 1073741824" 2>/dev/null || true)"
+    local i=$((val / 1073741824)) f=$(((val % 1073741824) * 100 / 1073741824))
+    printf "%d.%02d GiB" "$i" "$f"
   elif (( val >= 1048576 )); then
-    printf "%.2f MiB" "$(bc -l <<< "$val / 1048576" 2>/dev/null || true)"
+    local i=$((val / 1048576)) f=$(((val % 1048576) * 100 / 1048576))
+    printf "%d.%02d MiB" "$i" "$f"
   elif (( val >= 1024 )); then
-    printf "%.2f KiB" "$(bc -l <<< "$val / 1024" 2>/dev/null || true)"
+    local i=$((val / 1024)) f=$(((val % 1024) * 100 / 1024))
+    printf "%d.%02d KiB" "$i" "$f"
   else
     printf "%d B" "$val"
   fi
@@ -317,23 +303,30 @@ collect_cpu_usage() {
   fi
 }
 
+# Cache lspci output to avoid repeated invocations
+LSPCI_CACHED=""
+LSPCI_MM_CACHED=""
+cache_lspci() {
+  [[ -z "$LSPCI_CACHED" ]] && LSPCI_CACHED=$(lspci 2>/dev/null || true)
+  [[ -z "$LSPCI_MM_CACHED" ]] && LSPCI_MM_CACHED=$(lspci -mm 2>/dev/null || true)
+}
+
 # -- GPU --
 collect_gpu() {
+  cache_lspci
   local idx=0
-  if has_cmd lspci; then
+  if [[ -n "$LSPCI_MM_CACHED" ]]; then
     while IFS= read -r line; do
-      if [[ "$line" =~ VGA|3D|Display ]]; then
-        local dev ven rev
-        # lspci -mm uses quoted fields; parse accordingly
-        dev=$(echo "$line" | sed -n 's/^[^"]*"\([^"]*\)".*/\1/p')
-        ven=$(echo "$line" | sed -n 's/^[^"]*"[^"]*"[[:space:]]*"\([^"]*\)".*/\1/p')
-        rev=$(echo "$line" | sed -n 's/.*(rev \([^)]*\)).*/\1/p')
-        store "gpu.${idx}.device" "$dev"
-        store "gpu.${idx}.vendor" "$ven"
-        store "gpu.${idx}.revision" "$rev"
-        ((idx++)) || true
-      fi
-    done < <(lspci -mm 2>/dev/null || true)
+      [[ "$line" =~ VGA|3D|Display ]] || continue
+      local dev ven rev
+      dev=$(echo "$line" | sed -n 's/^[^"]*"\([^"]*\)".*/\1/p')
+      ven=$(echo "$line" | sed -n 's/^[^"]*"[^"]*"[[:space:]]*"\([^"]*\)".*/\1/p')
+      rev=$(echo "$line" | sed -n 's/.*(rev \([^)]*\)).*/\1/p')
+      store "gpu.${idx}.device" "$dev"
+      store "gpu.${idx}.vendor" "$ven"
+      store "gpu.${idx}.revision" "$rev"
+      ((idx++)) || true
+    done <<< "$LSPCI_MM_CACHED"
   fi
   store "gpu.count" "$idx"
   if [[ -d /sys/class/drm ]]; then
@@ -344,9 +337,7 @@ collect_gpu() {
       store "drm.${cname}.vendor" "$(safe_read_line "$card/device/vendor" 2>/dev/null)"
       local mem
       mem=$(safe_read_line "$card/device/mem_info_vram_total" 2>/dev/null)
-      if [[ -n "$mem" ]]; then
-        store "drm.${cname}.vram" "$((mem / 1048576))"
-      fi
+      [[ -n "$mem" ]] && store "drm.${cname}.vram" "$((mem / 1048576))"
     done
   fi
 }
@@ -515,10 +506,9 @@ collect_temps() {
     temp=$(safe_read_line "$zone/temp" 2>/dev/null || echo "0")
     type=$(safe_read_line "$zone/type" 2>/dev/null || echo "unknown")
     if [[ "$temp" -gt 0 ]]; then
-      local temp_c
-      temp_c=$(bc -l <<< "$temp / 1000" 2>/dev/null || echo "0")
+      local int=$((temp / 1000)) frac=$(((temp % 1000) / 100))
       store "temp.${tidx}.name" "$type"
-      store "temp.${tidx}.celsius" "$(printf "%.1f" "$temp_c")"
+      store "temp.${tidx}.celsius" "${int}.${frac}"
       ((tidx++)) || true
     fi
   done
@@ -533,9 +523,8 @@ collect_temps() {
         tname="${temp_input##*/}"
         tname="${tname%_input}"
         if [[ "$tval" -gt 0 ]]; then
-          local tc
-          tc=$(bc -l <<< "$tval / 1000" 2>/dev/null || echo "0")
-          store "temp.hwmon.${tname}.celsius" "$(printf "%.1f" "$tc")"
+          local int=$((tval / 1000)) frac=$(((tval % 1000) / 100))
+          store "temp.hwmon.${tname}.celsius" "${int}.${frac}"
           local label
           label="$(safe_read_line "${temp_input%_input}_label")"
           store "temp.hwmon.${tname}.label" "$label"
@@ -682,17 +671,17 @@ collect_network() {
 
 # -- Audio --
 collect_audio() {
+  cache_lspci
   local idx=0
-  if has_cmd lspci; then
+  if [[ -n "$LSPCI_CACHED" ]]; then
     while IFS= read -r line; do
-      if [[ "$line" =~ Audio|HDA|HDMI|AC97|S/PDIF|I82801|CA0132|CA0110|SB|ALC ]]; then
-        local dev
-        dev=$(echo "$line" | sed 's/.*: //; s/ (.*//')
-        store "audio.${idx}.device" "$dev"
-        store "audio.${idx}.pci" "$(echo "$line" | awk '{print $1}')"
-        ((idx++)) || true
-      fi
-    done < <(lspci 2>/dev/null || true)
+      [[ "$line" =~ Audio|HDMI|HDA|AC97 ]] || continue
+      local dev
+      dev=$(echo "$line" | sed 's/.*: //; s/ (.*//')
+      store "audio.${idx}.device" "$dev"
+      store "audio.${idx}.pci" "$(echo "$line" | awk '{print $1}')"
+      ((idx++)) || true
+    done <<< "$LSPCI_CACHED"
   fi
   store "audio.count" "$idx"
 
@@ -745,16 +734,17 @@ collect_usb() {
 
 # -- PCI --
 collect_pci() {
-  if has_cmd lspci; then
-    local idx=0
+  cache_lspci
+  local idx=0
+  if [[ -n "$LSPCI_CACHED" ]]; then
     while IFS= read -r line; do
-      local slot cls ven dev rev desc
+      local slot desc
       slot=$(echo "$line" | awk '{print $1}')
       desc=$(echo "$line" | sed 's/^[^ ]* //; s/ (.*//')
       store "pci.${idx}.slot" "$slot"
       store "pci.${idx}.description" "$desc"
       ((idx++)) || true
-    done < <(lspci 2>/dev/null || true)
+    done <<< "$LSPCI_CACHED"
     store "pci.count" "$idx"
   fi
 }
@@ -908,7 +898,7 @@ collect_virtualization() {
   # Check systemd
   if has_cmd systemd-detect-virt; then
     local sdv
-    sdv=$(systemd-detect-virt 2>/dev/null || echo "none")
+    sdv=$(systemd-detect-virt 2>/dev/null) || sdv="none"
     [[ "$sdv" != "none" ]] && virt="$sdv"
   fi
 
@@ -923,7 +913,7 @@ collect_virtualization() {
   fi
 
   store "virtualization.type" "${virt:-none}"
-  store "virtualization.is_vm" "$( [[ -n "$virt" ]] && echo "yes" || echo "no" )"
+  store "virtualization.is_vm" "$( [[ -n "$virt" && "$virt" != "none" ]] && echo "yes" || echo "no" )"
 }
 
 # -- Uptime --
@@ -1027,6 +1017,8 @@ collect_all() {
   collect_system_load
 }
 
+# collect_cpu_usage adds ~300ms delay from sampling.
+# Only call collect_all_with_usage when CPU usage is explicitly needed.
 collect_all_with_usage() {
   collect_all
   collect_cpu_usage
@@ -1456,8 +1448,8 @@ render_virtualization() {
   fi
   section "Virtualization"
   if [[ "$is_vm" == "yes" ]]; then
-    kv "Hypervisor" "${Y}${virt}${NC}" "$Y"
-  else
+    kv "Hypervisor" "$virt" "$Y"
+  elif [[ "$virt" != "none" ]]; then
     checked_kv "Type" "$virt"
   fi
   [[ -n "$container" ]] && kv "Container" "$container" "$Y"
@@ -2375,12 +2367,12 @@ cmd_menu() {
     read -r choice
     case "$choice" in
       1)
-        collect_all_with_usage
+        collect_all
         render_minimal
         printf "\n  ${D}Press Enter to continue...${NC}" && read -r
         ;;
       2)
-        collect_all_with_usage
+        collect_all
         render_all
         printf "\n  ${D}Press Enter to continue...${NC}" && read -r
         ;;
@@ -2397,17 +2389,17 @@ cmd_menu() {
         cmd_watch "$iv"
         ;;
       5)
-        collect_all_with_usage
+        collect_all
         export_json | less -R 2>/dev/null || export_json
         printf "\n  ${D}Press Enter to continue...${NC}" && read -r
         ;;
       6)
-        collect_all_with_usage
+        collect_all
         export_markdown | less -R 2>/dev/null || export_markdown
         printf "\n  ${D}Press Enter to continue...${NC}" && read -r
         ;;
       7)
-        collect_all_with_usage
+        collect_all
         export_html | less -R 2>/dev/null || export_html
         printf "\n  ${D}Press Enter to continue...${NC}" && read -r
         ;;
@@ -2437,13 +2429,13 @@ cmd_menu_sections() {
     printf "\033[H\033[J"
     printf "${BOLD}${C}┌──────────────────────── Sections ─────────────────────────┐${NC}\n"
     printf "${BOLD}${C}│${NC}                                                          ${BOLD}${C}│${NC}\n"
-    printf "${BOLD}${C}│${NC}    ${BOLD}1${NC})  Machine        ${BOLD}8${NC})  Displays      ${BOLD}15${NC}) USB     ${BOLD}${C}│${NC}\n"
-    printf "${BOLD}${C}│${NC}    ${BOLD}2${NC})  CPU            ${BOLD}9${NC})  Motherboard   ${BOLD}16${NC}) PCI     ${BOLD}${C}│${NC}\n"
-    printf "${BOLD}${C}│${NC}    ${BOLD}3${NC})  GPU           ${BOLD}10${NC})  BIOS          ${BOLD}17${NC}) OS      ${BOLD}${C}│${NC}\n"
-    printf "${BOLD}${C}│${NC}    ${BOLD}4${NC})  Memory        ${BOLD}11${NC})  Network       ${BOLD}18${NC}) Kernel  ${BOLD}${C}│${NC}\n"
-    printf "${BOLD}${C}│${NC}    ${BOLD}5${NC})  Storage       ${BOLD}12${NC})  Audio         ${BOLD}19${NC}) Security${BOLD}${C}│${NC}\n"
-    printf "${BOLD}${C}│${NC}    ${BOLD}6${NC})  Battery       ${BOLD}13${NC})  Displays      ${BOLD}20${NC}) Uptime  ${BOLD}${C}│${NC}\n"
-    printf "${BOLD}${C}│${NC}    ${BOLD}7${NC})  Temperatures  ${BOLD}14${NC})  Fans          ${BOLD}21${NC}) Processes${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}1${NC})  Machine        ${BOLD}8${NC})  Displays      ${BOLD}15${NC}) PCI       ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}2${NC})  CPU            ${BOLD}9${NC})  Motherboard   ${BOLD}16${NC}) OS        ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}3${NC})  GPU           ${BOLD}10${NC})  BIOS          ${BOLD}17${NC}) Kernel    ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}4${NC})  Memory        ${BOLD}11${NC})  Network       ${BOLD}18${NC}) Security  ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}5${NC})  Storage       ${BOLD}12${NC})  Audio         ${BOLD}19${NC}) Virt     ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}6${NC})  Battery       ${BOLD}13${NC})  Fans          ${BOLD}20${NC}) Uptime   ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}7${NC})  Temperatures  ${BOLD}14${NC})  USB           ${BOLD}21${NC}) Processes${BOLD}${C}│${NC}\n"
     printf "${BOLD}${C}│${NC}                                                          ${BOLD}${C}│${NC}\n"
     printf "${BOLD}${C}│${NC}    ${BOLD}b${NC})  Back to main menu                                     ${BOLD}${C}│${NC}\n"
     printf "${BOLD}${C}└──────────────────────────────────────────────────────────┘${NC}\n"
@@ -2454,13 +2446,16 @@ cmd_menu_sections() {
       [0-9]|[1-2][0-9])
         local names=(
           machine cpu gpu memory storage battery temps fans displays
-          motherboard bios network audio displays fans usb pci os kernel
-          security uptime processes
+          motherboard bios network audio usb pci os kernel
+          security virt uptime processes
         )
         local idx=$((sec-1))
         [[ "$idx" -ge 0 && "$idx" -lt "${#names[@]}" ]] || { printf "\n  ${R}Invalid.${NC} ${D}Press Enter...${NC}" && read -r; continue; }
-        collect_all; collect_cpu_usage
-        "render_${names[$idx]}"
+        collect_all
+        local sname="${names[$idx]}"
+        [[ "$sname" == "cpu" ]] && collect_cpu_usage
+        [[ "$sname" == "virt" ]] && sname="virtualization"
+        "render_${sname}"
         printf "\n  ${D}Press Enter to continue...${NC}" && read -r
         ;;
       *) printf "\n  ${R}Invalid.${NC} ${D}Press Enter...${NC}" && read -r ;;
@@ -2520,8 +2515,8 @@ main() {
   if [[ -n "$cmd" ]]; then
     case "$cmd" in
       menu|interactive) cmd_menu; return ;;
-      minimal) collect_all_with_usage; render_minimal; return ;;
-      full) collect_all_with_usage; render_all; return ;;
+      minimal) collect_all; render_minimal; return ;;
+      full) collect_all; render_all; return ;;
       doctor) collect_all_with_usage; cmd_doctor; return ;;
       watch)
         cmd_watch "${arg1:-2}"
@@ -2538,8 +2533,10 @@ main() {
         ;;
       machine|cpu|gpu|memory|storage|battery|fans|temps|displays|motherboard|bios|network|audio|usb|pci|os|kernel|security|virt|uptime|processes)
         collect_all
-        collect_cpu_usage
-        "render_$cmd"
+        local rcmd="$cmd"
+        [[ "$rcmd" == "virt" ]] && rcmd="virtualization"
+        [[ "$rcmd" == "cpu" ]] && collect_cpu_usage
+        "render_${rcmd}"
         return
         ;;
       *)
@@ -2553,7 +2550,7 @@ main() {
     return
   fi
 
-  collect_all_with_usage
+  collect_all
 
   case "$format" in
     json)     export_json ;;
