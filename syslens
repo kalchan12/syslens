@@ -703,7 +703,7 @@ collect_audio() {
   fi
   if has_cmd pw-cli; then
     local nodes
-    nodes=$(pw-cli list-nodes 2>/dev/null | grep -c "node.name" || echo "0")
+    nodes=$(pw-cli list-nodes 2>/dev/null | grep -c "node.name") || nodes=0
     store "audio.pipewire_nodes" "$nodes"
   fi
 }
@@ -799,7 +799,7 @@ collect_kernel() {
   store "kernel.version" "$(uname -v)"
   store "kernel.machine" "$(uname -m)"
   local modules
-  modules=$(lsmod 2>/dev/null | tail -n +2 | wc -l || echo "0")
+  modules=$(lsmod 2>/dev/null | tail -n +2 | wc -l) || modules=0
   store "kernel.modules" "$modules"
   # Command line
   store "kernel.cmdline" "$(safe_read_line /proc/cmdline)"
@@ -831,7 +831,7 @@ collect_security() {
     store "security.firewalld" "$(firewall-cmd --state 2>/dev/null || echo "inactive")"
   elif has_cmd iptables; then
     local rules
-    rules=$(iptables -L -n 2>/dev/null | grep -c "^Chain" || echo "0")
+    rules=$(iptables -L -n 2>/dev/null | grep -c "^Chain") || rules=0
     store "security.iptables_rules" "$rules"
   fi
 
@@ -944,14 +944,16 @@ collect_uptime() {
 # -- Processes --
 collect_processes() {
   local total running sleeping zombie stopped
-  total=$(ps -e 2>/dev/null | wc -l)
-  [[ -z "$total" ]] && total=$(ls /proc/[0-9]* 2>/dev/null | wc -l || echo "0")
+  total=$(ps -e 2>/dev/null | wc -l) || total=0
+  if [[ -z "$total" || "$total" -eq 0 ]]; then
+    total=$(ls /proc/[0-9]* 2>/dev/null | wc -l) || total=0
+  fi
   store "process.total" "$((total - 1))"
 
-  running=$(ps -e -o state= 2>/dev/null | grep -c "^R" || echo "0")
-  sleeping=$(ps -e -o state= 2>/dev/null | grep -c "^S" || echo "0")
-  zombie=$(ps -e -o state= 2>/dev/null | grep -c "^Z" || echo "0")
-  stopped=$(ps -e -o state= 2>/dev/null | grep -c "^T" || echo "0")
+  running=$(ps -e -o state= 2>/dev/null | grep -c "^R") || running=0
+  sleeping=$(ps -e -o state= 2>/dev/null | grep -c "^S") || sleeping=0
+  zombie=$(ps -e -o state= 2>/dev/null | grep -c "^Z") || zombie=0
+  stopped=$(ps -e -o state= 2>/dev/null | grep -c "^T") || stopped=0
 
   store "process.running" "$running"
   store "process.sleeping" "$sleeping"
@@ -979,12 +981,21 @@ collect_processes() {
 
 # -- System load (doctor helper) --
 collect_system_load() {
-  store "system.fd_count" "$(ls /proc/*/fd 2>/dev/null | wc -l || echo "0")"
+  local fd=0
+  local p fds
+  for p in /proc/[0-9]*/fd; do
+    [[ -d "$p" ]] || continue
+    fds=("$p"/*)
+    fd=$((fd + ${#fds[@]}))
+  done
+  store "system.fd_count" "$fd"
   # Number of logged in users
   store "system.users" "$(users | wc -w)"
   # Running services
   if has_cmd systemctl; then
-    store "system.services_running" "$(systemctl list-units --type=service --state=running 2>/dev/null | grep -c "running" || echo "0")"
+    local svc
+    svc=$(systemctl list-units --type=service --state=running 2>/dev/null | grep -c "running") || svc=0
+    store "system.services_running" "$svc"
   fi
 }
 
