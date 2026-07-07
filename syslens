@@ -944,6 +944,147 @@ render_all() {
   render_security; render_virtualization; render_processes; render_system_load
 }
 
+# ── Doctor (Health Diagnostics) ────────────────
+
+cmd_doctor() {
+  collect_all; collect_cpu_load; collect_cpu_usage
+  printf "\n${BOLD}${UNDER}syslens Health Report${NC} ${D}v${VERSION}${NC}\n"
+  printf "${D}%s${NC}\n" "$(printf "%0.s─" $(seq 1 62))"
+  local issues=0
+  local t_kb=$(get memory.total_kb) a_kb=$(get memory.avail_kb)
+  if [[ "$t_kb" -gt 0 ]]; then
+    local mp=$(( (t_kb - a_kb) * 100 / t_kb ))
+    if (( mp > 90 )); then printf "${R}✗${NC} Memory critical: %d%%\n" "$mp"; ((issues++))
+    elif (( mp > 75 )); then printf "${Y}⚠${NC} Memory high: %d%%\n" "$mp"; ((issues++))
+    else printf "${G}✓${NC} Memory normal: %d%%\n" "$mp"; fi
+  fi
+  local l1=$(get cpu.load_1m) lc=$(get cpu.logical)
+  if [[ -n "$l1" && -n "$lc" && "$lc" -gt 0 ]] && (( $(bc -l <<< "$l1 > $lc * 0.9" 2>/dev/null || echo 0) )); then
+    printf "${Y}⚠${NC} CPU load high: %s\n" "$l1"; ((issues++))
+  else printf "${G}✓${NC} CPU load normal: %s\n" "$l1"; fi
+  local tc=$(get temp.count)
+  for ((i=0; i<tc; i++)); do
+    local c=$(get temp.${i}.celsius) ci=${c%.*} n=$(get temp.${i}.name)
+    if [[ -n "$c" && "$ci" -ge 80 ]]; then printf "${R}✗${NC} Temp critical: %s %s°C\n" "$n" "$c"; ((issues++))
+    elif [[ -n "$c" && "$ci" -ge 60 ]]; then printf "${Y}⚠${NC} Temp high: %s %s°C\n" "$n" "$c"; ((issues++)); fi
+  done
+  local bc=$(get battery.count)
+  for ((i=0; i<bc; i++)); do
+    local cap=$(get battery.${i}.capacity)
+    [[ -n "$cap" && "$cap" -lt 20 ]] && printf "${Y}⚠${NC} Battery critical: %s%%\n" "$cap" && ((issues++))
+  done
+  local sw_t=$(get memory.swap_total_kb) sw_f=$(get memory.swap_free_kb)
+  if [[ -n "$sw_t" && "$sw_t" -gt 0 ]]; then
+    local sp=$(( (sw_t - sw_f) * 100 / sw_t ))
+    (( sp > 80 )) && printf "${Y}⚠${NC} Swap high: %d%%\n" "$sp" && ((issues++))
+  fi
+  local fc=$(get fs.count)
+  for ((i=0; i<fc; i++)); do local up=$(get fs.${i}.use_pct) m=$(get fs.${i}.mount)
+    [[ -n "$up" && "$up" -gt 90 ]] && printf "${R}✗${NC} Disk %s critical: %d%%\n" "$m" "$up" && ((issues++))
+  done
+  local z=$(get process.zombie); [[ -n "$z" && "$z" -gt 0 ]] && printf "${Y}⚠${NC} Zombie processes: %s\n" "$z" && ((issues++))
+  local dd=$(get uptime.days); [[ -n "$dd" && "$dd" -gt 60 ]] && printf "${Y}⚠${NC} Uptime %sd - consider reboot\n" "$dd" && ((issues++))
+  local aslr=$(get security.aslr); [[ "$aslr" =~ disabled ]] && printf "${R}✗${NC} ASLR disabled!\n" && ((issues++))
+  printf "${D}%s${NC}\n" "$(printf "%0.s─" $(seq 1 62))"
+  if [[ "$issues" -eq 0 ]]; then printf "${G}✓${NC} System appears healthy\n"
+  else printf "${Y}⚠${NC} %d issue(s) found\n" "$issues"; fi
+  printf "\n"
+}
+
+# ── Snapshot ────────────────────────────────────
+
+SNAPSHOT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/syslens/snapshots"
+
+cmd_snapshot_save() {
+  mkdir -p "$SNAPSHOT_DIR"
+  collect_all; collect_cpu_load; collect_cpu_usage
+  local ts; ts=$(date '+%Y%m%d_%H%M%S')
+  local file="${SNAPSHOT_DIR}/$(get machine.hostname)_${ts}.json"
+  export_json > "$file"
+  printf "${G}✓${NC} Snapshot saved: ${B}%s${NC}\n" "$file"
+}
+
+cmd_snapshot_list() {
+  mkdir -p "$SNAPSHOT_DIR"
+  local files=("$SNAPSHOT_DIR"/*.json)
+  [[ ! -f "${files[0]}" ]] && { printf "${Y}No snapshots.${NC}\n"; return; }
+  for f in "${files[@]}"; do
+    local ts="${f#*_}"; ts="${ts%.json}"; ts="${ts/_/ }"
+    printf "  %s  ${D}(%s)${NC}\n" "$ts" "$(du -h "$f" | cut -f1)"
+  done
+}
+
+cmd_snapshot_diff() {
+  local target="${1:-}"
+  local files=("$SNAPSHOT_DIR"/*.json)
+  [[ ! -f "${files[0]}" ]] && { printf "${R}No snapshots.${NC}\n"; return; }
+  [[ -z "$target" ]] && target="${files[${#files[@]}-1]}"
+  [[ ! -f "$target" ]] && { printf "${R}Not found: %s${NC}\n" "$target"; return; }
+  collect_all; collect_cpu_load; collect_cpu_usage
+  local cur; cur=$(export_json)
+  printf "${BOLD}Diff:${NC} ${D}%s${NC}\n\n" "${target##*/}"
+  python3 -c "
+import json, sys
+with open('$target') as f: old = json.load(f)
+cur = json.loads('''$cur''')
+def flat(d, p=''):
+    items=[]
+    for k,v in d.items():
+        items.extend(flat(v, p+k+'.') if isinstance(v,dict) else [(p+k,str(v))])
+    return items
+o, c = dict(flat(old)), dict(flat(cur))
+ch, ad, rm = 0, 0, 0
+for k in sorted(set(list(o.keys())+list(c.keys()))):
+    ov, cv = o.get(k,'<MISSING>'), c.get(k,'<MISSING>')
+    if ov != cv:
+        if k in o and k not in c: print(f'  REMOVED  {k}'); rm+=1
+        elif k not in o and k in c: print(f'  ADDED    {k}: {cv}'); ad+=1
+        else: print(f'  CHANGED  {k}: {ov} -> {cv}'); ch+=1
+print(f'\n{ch} changed, {ad} added, {rm} removed')
+" 2>/dev/null || warn "Python3 required for diff"
+}
+
+# ── Watch Mode ──────────────────────────────────
+
+cmd_watch() {
+  local interval="${1:-2}"
+  printf "${C}syslens${NC} ${D}watch (every ${interval}s) - Ctrl+C${NC}\n"
+  while true; do
+    printf "\033[H\033[J"
+    printf "${BOLD}${C}syslens${NC} ${D}watch • %s${NC}\n" "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf "${D}%s${NC}\n" "$(printf "%0.s─" $(seq 1 62))"
+    unset SYS; declare -gA SYS
+    collect_all; collect_cpu_load; collect_cpu_usage
+    local model=$(get cpu.model) l1=$(get cpu.load_1m) l5=$(get cpu.load_5m) l15=$(get cpu.load_15m)
+    local usage=$(get cpu.usage_percent) cc=$(get cpu.logical)
+    local us="${D}N/A${NC}"; [[ -n "$usage" ]] && us="${G}${usage}%${NC}"
+    printf "${B}CPU:${NC} %s\n  ${D}Load:${NC} %s %s %s  ${D}Usage:${NC} %s  ${D}Cores:${NC} %s\n" "$model" "$l1" "$l5" "$l15" "$us" "$cc"
+    local tm=$(($(get memory.total_kb)/1024)) am=$(($(get memory.avail_kb)/1024)) um=$((tm-am)) pm=$(( (tm-am)*100/tm ))
+    local bl=25 fl=$((pm*bl/100)) bar="[${G}"; for ((i=0;i<fl;i++)); do bar+="█"; done
+    bar+="${D}"; for ((i=0;i<bl-fl;i++)); do bar+="░"; done; bar+="${NC}]"
+    printf "${B}MEM:${NC} %s %s/%s MiB (%d%%)\n" "$bar" "$um" "$tm" "$pm"
+    printf "${B}FS:${NC} "
+    local fcount=$(get fs.count) shown=0
+    for ((i=0; i<fcount; i++)); do
+      local m=$(get fs.${i}.mount) p=$(get fs.${i}.use_pct)
+      [[ "$m" != "/" && "$m" != "/home" && "$m" != "/boot" ]] && continue
+      local col=$G; (( p > 90 )) && col=$R; (( p >= 75 && p <= 90 )) && col=$Y
+      printf "${col}%s %s%%${NC}  " "$m" "$p"; ((shown++)) || true
+    done; (( shown == 0 )) && printf "${D}N/A${NC}"; printf "\n"
+    printf "${B}TEMP:${NC} " 
+    local tc=$(get temp.count); shown=0
+    for ((i=0; i<tc; i++)); do
+      local n=$(get temp.${i}.name) c=$(get temp.${i}.celsius) ci=${c%.*}
+      echo "$n" | grep -qiE "cpu|core|package|pch|soc|gpu" || continue
+      local col=$G; (( ci >= 80 )) && col=$R; (( ci >= 60 && ci < 80 )) && col=$Y
+      printf "${col}%s %s°C${NC}  " "$n" "$c"; ((shown++)) || true
+    done; (( shown == 0 )) && printf "${D}N/A${NC}"; printf "\n"
+    printf "${B}UP:${NC} %s\n" "$(get uptime.display)"
+    printf "${D}%s${NC}\n" "$(printf "%0.s─" $(seq 1 62))"
+    sleep "$interval"
+  done
+}
+
 # ── Main CLI ────────────────────────────────────
 
 usage() {
@@ -956,6 +1097,8 @@ ${BOLD}Commands:${NC}
   ${G}syslens${NC}           Show all system information
   ${G}syslens <section>${NC} Show section: cpu memory os kernel machine uptime gpu storage battery fans temps displays motherboard bios network audio usb pci security virt processes
   ${G}syslens doctor${NC}    Run health diagnostics
+  ${G}syslens watch${NC} [s] Live monitoring (default 2s)
+  ${G}syslens snapshot${NC}  save|list|diff snapshots
   ${G}syslens help${NC}      Show this help
 
 ${BOLD}Options:${NC}
@@ -983,7 +1126,15 @@ main() {
   cmd="${args[0]:-}"
   if [[ -n "$cmd" ]]; then
     case "$cmd" in
-      doctor|watch|snapshot) echo "Coming in next commit."; return ;;
+      doctor) collect_all; collect_cpu_load; collect_cpu_usage; cmd_doctor; return ;;
+      watch) cmd_watch "${args[1]:-2}"; return ;;
+      snapshot)
+        case "${args[1]:-}" in
+          save) cmd_snapshot_save; return ;;
+          list) cmd_snapshot_list; return ;;
+          diff) cmd_snapshot_diff "${args[2]:-}"; return ;;
+          *) echo "Usage: syslens snapshot save|list|diff [file]"; return ;;
+        esac ;;
       cpu) collect_all; collect_cpu_load; collect_cpu_usage; render_cpu; return ;;
       machine|memory|os|kernel|uptime|gpu|storage|battery|fans|temps|displays|motherboard|bios|network|audio|usb|pci|security|virt|processes)
         collect_all; collect_cpu_load; "render_$cmd"; return ;;
