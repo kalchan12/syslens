@@ -6,7 +6,9 @@
 # and kernel interfaces before falling back to external utilities.
 #
 # Usage: syslens [command] [options]
-#   syslens                    Show all system information
+#   syslens                    Interactive menu (default in terminal)
+#   syslens minimal            Show concise system overview
+#   syslens full               Show all system information
 #   syslens cpu                Show CPU information only
 #   syslens --json             Output as JSON
 #   syslens doctor             Run health diagnostics
@@ -1269,8 +1271,8 @@ render_displays() {
     kv "Displays" "${D}No display information${NC}" "$D"
   fi
 
-  local bl=$(get display.backlight)
-  local mbl=$(get display.max_backlight)
+  local bl; bl=$(get display.backlight)
+  local mbl; mbl=$(get display.max_backlight)
   if [[ -n "$bl" && -n "$mbl" ]]; then
     local bl_pct=$((bl * 100 / mbl))
     kv "Brightness" "${bl_pct}%"
@@ -2253,7 +2255,10 @@ ${BOLD}Usage:${NC}
   ${B}syslens${NC} [command] [options]
 
 ${BOLD}Commands:${NC}
-  ${G}syslens${NC}                    Show all system information (default)
+  ${G}syslens${NC}                    Interactive menu (default in terminal)
+  ${G}syslens full${NC}              Show all system information
+  ${G}syslens minimal${NC}           Show concise system overview
+  ${G}syslens help${NC}              Show this help message
   ${G}syslens <section>${NC}         Show a specific section:
                   machine  cpu  gpu  memory  storage  battery  fans
                   temps  displays  motherboard  bios  network  audio
@@ -2263,7 +2268,6 @@ ${BOLD}Commands:${NC}
   ${G}syslens snapshot save${NC}     Save system snapshot
   ${G}syslens snapshot list${NC}     List saved snapshots
   ${G}syslens snapshot diff${NC} [f] Compare with snapshot
-  ${G}syslens help${NC}              Show this help message
 
 ${BOLD}Options:${NC}
   ${D}--json${NC}                    Output as JSON
@@ -2274,7 +2278,9 @@ ${BOLD}Options:${NC}
   ${D}--version${NC}                 Show version
 
 ${BOLD}Examples:${NC}
-  syslens                            Show everything
+  syslens                            Interactive menu
+  syslens minimal                    Minimal overview
+  syslens full                       Full system info
   syslens cpu                        CPU info only
   syslens --json                     Full system info as JSON
   syslens doctor                     Health check
@@ -2291,6 +2297,198 @@ version_info() {
   printf "syslens v%s\n" "$VERSION"
   printf "Linux System Inspection & Diagnostics Tool\n"
   exit 0
+}
+
+# ──────────────────────────────────────────────
+#  MINIMAL RENDER
+# ──────────────────────────────────────────────
+
+render_minimal() {
+  printf "\n${BOLD}${C}syslens${NC} ${D}— System Overview${NC}\n"
+  printf "${D}%s${NC}\n" "$(printf "%0.s${H_LINE}" $(seq 1 62))"
+  kv "OS" "$(get os.pretty_name)" "$G"
+  kv "  Arch" "$(get os.arch)"
+  kv "  Kernel" "$(get kernel.release)" "$D"
+  kv "CPU" "$(get cpu.model)" "$C"
+  kv "  Cores" "$(get cpu.logical) logical / $(get cpu.physical_total) physical"
+  local l1=$(get cpu.load_1m) l5=$(get cpu.load_5m) l15=$(get cpu.load_15m)
+  kv "  Load" "${l1} / ${l5} / ${l15} (1/5/15m)"
+  local u=$(get cpu.usage_percent)
+  if [[ -n "$u" ]]; then
+    local uc=$G; (( u > 80 )) && uc=$R; (( u >= 50 && u <= 80 )) && uc=$Y
+    kv "  Usage" "${uc}${u}%${NC}"
+  fi
+  local tk="${SYS[memory.total_kb]:-0}" ak="${SYS[memory.avail_kb]:-0}"
+  local tm=$((tk/1024))
+  local am=$((ak/1024))
+  local um=$((tm-am))
+  local pm=0
+  (( tm > 0 )) && pm=$(( (tm-am)*100/tm ))
+  local bl=30
+  local fl=$((pm*bl/100))
+  local bar="[${G}"; for ((i=0;i<fl;i++)); do bar+="█"; done
+  bar+="${D}"; for ((i=0;i<bl-fl;i++)); do bar+="░"; done; bar+="${NC}]"
+  kv "Memory" "${um} / ${tm} MiB used"
+  kv "  Usage" "${bar} ${pm}%"
+  local s=$(get storage.count)
+  if [[ "$s" -gt 0 ]]; then
+    for ((i=0; i<s; i++)); do
+      local dn=$(get storage.${i}.name) ds=$(get storage.${i}.size)
+      kv "Disk $((i+1))" "/dev/${dn}  (${ds})" "$D"
+    done
+  fi
+  local fc=$(get fs.count)
+  for ((i=0; i<fc; i++)); do
+    local m=$(get fs.${i}.mount) p=$(get fs.${i}.use_pct)
+    [[ "$m" != "/" && "$m" != "/home" && "$m" != "/boot" ]] && continue
+    local pc=$G; (( p > 90 )) && pc=$R; (( p >= 75 && p <= 90 )) && pc=$Y
+    kv "  ${m}" "${pc}${p}% used${NC}"
+  done
+  kv "Uptime" "$(get uptime.display)" "$C"
+  kv "Processes" "$(get process.total) total, $(get process.running) running"
+  kv "Boot" "$(date -d "@$(get uptime.boot_time)" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$D"
+  printf "${D}%s${NC}\n" "$(printf "%0.s${H_LINE}" $(seq 1 62))"
+}
+
+# ──────────────────────────────────────────────
+#  INTERACTIVE MENU
+# ──────────────────────────────────────────────
+
+cmd_menu() {
+  local choice
+  while true; do
+    printf "\033[H\033[J"
+    printf "${BOLD}${C}┌─────────────────────────── syslens ───────────────────────────┐${NC}\n"
+    printf "${BOLD}${C}│${NC}  ${B}Linux System Inspection & Diagnostics${NC} ${D}v${VERSION}${NC}              ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}├──────────────────────────────────────────────────────────────┤${NC}\n"
+    printf "${BOLD}${C}│${NC}                                                              ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}1${NC}) ${G}Minimal System Info${NC}      ${BOLD}5${NC}) Export as ${Y}JSON${NC}             ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}2${NC}) ${C}Full System Info${NC}         ${BOLD}6${NC}) Export as ${Y}Markdown${NC}         ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}3${NC}) ${R}Health Report${NC}            ${BOLD}7${NC}) Export as ${Y}HTML${NC}             ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}4${NC}) ${M}Live Watch${NC}               ${BOLD}8${NC}) Select ${D}Section...${NC}          ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}                                                              ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}s${NC}) ${Y}Snapshot${NC} (save/list/diff)  ${BOLD}h${NC}) ${D}Help${NC}                     ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}q${NC}) ${R}Quit${NC}                                                       ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}                                                              ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}└──────────────────────────────────────────────────────────────┘${NC}\n"
+    printf "\n  ${D}Enter choice${NC} [1-8, s, h, q]: "
+    read -r choice
+    case "$choice" in
+      1)
+        collect_all_with_usage
+        render_minimal
+        printf "\n  ${D}Press Enter to continue...${NC}" && read -r
+        ;;
+      2)
+        collect_all_with_usage
+        render_all
+        printf "\n  ${D}Press Enter to continue...${NC}" && read -r
+        ;;
+      3)
+        collect_all_with_usage
+        cmd_doctor
+        printf "\n  ${D}Press Enter to continue...${NC}" && read -r
+        ;;
+      4)
+        local iv
+        printf "  ${D}Interval (seconds)${NC} [2]: "
+        read -r iv
+        iv="${iv:-2}"
+        cmd_watch "$iv"
+        ;;
+      5)
+        collect_all_with_usage
+        export_json | less -R 2>/dev/null || export_json
+        printf "\n  ${D}Press Enter to continue...${NC}" && read -r
+        ;;
+      6)
+        collect_all_with_usage
+        export_markdown | less -R 2>/dev/null || export_markdown
+        printf "\n  ${D}Press Enter to continue...${NC}" && read -r
+        ;;
+      7)
+        collect_all_with_usage
+        export_html | less -R 2>/dev/null || export_html
+        printf "\n  ${D}Press Enter to continue...${NC}" && read -r
+        ;;
+      8)
+        cmd_menu_sections
+        ;;
+      s|S)
+        cmd_menu_snapshot
+        ;;
+      h|H)
+        usage
+        ;;
+      q|Q)
+        printf "\n  ${G}Goodbye.${NC}\n"
+        exit 0
+        ;;
+      *)
+        printf "\n  ${R}Invalid choice.${NC} ${D}Press Enter...${NC}" && read -r
+        ;;
+    esac
+  done
+}
+
+cmd_menu_sections() {
+  local sec
+  while true; do
+    printf "\033[H\033[J"
+    printf "${BOLD}${C}┌──────────────────────── Sections ─────────────────────────┐${NC}\n"
+    printf "${BOLD}${C}│${NC}                                                          ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}1${NC})  Machine        ${BOLD}8${NC})  Displays      ${BOLD}15${NC}) USB     ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}2${NC})  CPU            ${BOLD}9${NC})  Motherboard   ${BOLD}16${NC}) PCI     ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}3${NC})  GPU           ${BOLD}10${NC})  BIOS          ${BOLD}17${NC}) OS      ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}4${NC})  Memory        ${BOLD}11${NC})  Network       ${BOLD}18${NC}) Kernel  ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}5${NC})  Storage       ${BOLD}12${NC})  Audio         ${BOLD}19${NC}) Security${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}6${NC})  Battery       ${BOLD}13${NC})  Displays      ${BOLD}20${NC}) Uptime  ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}7${NC})  Temperatures  ${BOLD}14${NC})  Fans          ${BOLD}21${NC}) Processes${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}                                                          ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}b${NC})  Back to main menu                                     ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}└──────────────────────────────────────────────────────────┘${NC}\n"
+    printf "\n  ${D}Enter choice${NC} [1-21, b]: "
+    read -r sec
+    case "$sec" in
+      b|B) return ;;
+      [0-9]|[1-2][0-9])
+        local names=(
+          machine cpu gpu memory storage battery temps fans displays
+          motherboard bios network audio displays fans usb pci os kernel
+          security uptime processes
+        )
+        local idx=$((sec-1))
+        [[ "$idx" -ge 0 && "$idx" -lt "${#names[@]}" ]] || { printf "\n  ${R}Invalid.${NC} ${D}Press Enter...${NC}" && read -r; continue; }
+        collect_all; collect_cpu_usage
+        "render_${names[$idx]}"
+        printf "\n  ${D}Press Enter to continue...${NC}" && read -r
+        ;;
+      *) printf "\n  ${R}Invalid.${NC} ${D}Press Enter...${NC}" && read -r ;;
+    esac
+  done
+}
+
+cmd_menu_snapshot() {
+  local sn
+  while true; do
+    printf "\033[H\033[J"
+    printf "${BOLD}${C}┌─────────────────────── Snapshot ───────────────────────┐${NC}\n"
+    printf "${BOLD}${C}│${NC}                                                      ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}1${NC}) ${G}Save${NC} snapshot                                   ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}2${NC}) ${C}List${NC} snapshots                                  ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}3${NC}) ${Y}Diff${NC} with latest snapshot                        ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}│${NC}    ${BOLD}b${NC})  Back to main menu                                 ${BOLD}${C}│${NC}\n"
+    printf "${BOLD}${C}└──────────────────────────────────────────────────────┘${NC}\n"
+    printf "\n  ${D}Enter choice${NC} [1-3, b]: "
+    read -r sn
+    case "$sn" in
+      b|B) return ;;
+      1) cmd_snapshot_save; printf "\n  ${D}Press Enter...${NC}" && read -r ;;
+      2) cmd_snapshot_list; printf "\n  ${D}Press Enter...${NC}" && read -r ;;
+      3) cmd_snapshot_diff "${args[2]:-}"; printf "\n  ${D}Press Enter...${NC}" && read -r ;;
+      *) printf "\n  ${R}Invalid.${NC} ${D}Press Enter...${NC}" && read -r ;;
+    esac
+  done
 }
 
 # ──────────────────────────────────────────────
@@ -2321,6 +2519,9 @@ main() {
 
   if [[ -n "$cmd" ]]; then
     case "$cmd" in
+      menu|interactive) cmd_menu; return ;;
+      minimal) collect_all_with_usage; render_minimal; return ;;
+      full) collect_all_with_usage; render_all; return ;;
       doctor) collect_all_with_usage; cmd_doctor; return ;;
       watch)
         cmd_watch "${arg1:-2}"
@@ -2344,6 +2545,12 @@ main() {
       *)
         echo "Unknown command: $cmd"; usage ;;
     esac
+  fi
+
+  # Interactive menu when running interactively with no args
+  if [[ -t 0 ]] && [[ -t 1 ]]; then
+    cmd_menu
+    return
   fi
 
   collect_all_with_usage
