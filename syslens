@@ -37,6 +37,15 @@ safe_read_line() {
 }
 has_cmd() { command -v "$1" &>/dev/null; }
 
+fmt_size_bytes() {
+  local val=$1
+  if (( val >= 1099511627776 )); then printf "%.2f TiB" "$(bc -l <<< "$val / 1099511627776" 2>/dev/null || true)"
+  elif (( val >= 1073741824 )); then printf "%.2f GiB" "$(bc -l <<< "$val / 1073741824" 2>/dev/null || true)"
+  elif (( val >= 1048576 )); then printf "%.2f MiB" "$(bc -l <<< "$val / 1048576" 2>/dev/null || true)"
+  elif (( val >= 1024 )); then printf "%.2f KiB" "$(bc -l <<< "$val / 1024" 2>/dev/null || true)"
+  else printf "%d B" "$val"; fi
+}
+
 # Data store
 declare -A SYS=()
 store() { SYS["$1"]="$2"; }
@@ -311,6 +320,98 @@ collect_all() {
   collect_machine; collect_cpu; collect_memory; collect_os; collect_kernel; collect_uptime
   collect_gpu; collect_storage; collect_battery; collect_fans; collect_temps
   collect_displays; collect_motherboard; collect_bios
+  collect_network; collect_audio; collect_usb; collect_pci
+}
+
+# -- Network --
+collect_network() {
+  local idx=0
+  for net in /sys/class/net/*; do
+    [[ -d "$net" ]] || continue
+    local ifname="${net##*/}"
+    [[ "$ifname" == "lo" ]] && continue
+    store "net.${idx}.name" "$ifname"
+    store "net.${idx}.address" "$(safe_read_line "$net/address")"
+    local duplex speed operstate
+    duplex="$(safe_read_line "$net/duplex" 2>/dev/null || true)"
+    speed="$(safe_read_line "$net/speed" 2>/dev/null || true)"
+    operstate="$(safe_read_line "$net/operstate" 2>/dev/null || echo "unknown")"
+    store "net.${idx}.duplex" "$duplex"
+    store "net.${idx}.speed" "$speed"
+    store "net.${idx}.state" "$operstate"
+    ((idx++)) || true
+  done
+  store "net.count" "$idx"
+  # Traffic stats
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*([^:]+):[[:space:]]*(.*) ]]; then
+      local dev_name="${BASH_REMATCH[1]}" stats="${BASH_REMATCH[2]}"
+      local rx tx
+      rx=$(echo "$stats" | awk '{print $1}')
+      tx=$(echo "$stats" | awk '{print $9}')
+      for ((i=0; i<idx; i++)); do
+        [[ "$(get net.${i}.name)" == "$dev_name" ]] && store "net.${i}.rx_bytes" "$rx" && store "net.${i}.tx_bytes" "$tx"
+      done
+    fi
+  done < /proc/net/dev
+  store "net.default_gateway" "$(ip route show default 2>/dev/null | awk '{print $3}')"
+}
+
+# -- Audio --
+collect_audio() {
+  local idx=0
+  if has_cmd lspci; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ Audio|HDMI|HDA|AC97 ]]; then
+        local dev pci
+        dev=$(echo "$line" | sed 's/.*: //; s/ (.*//')
+        pci=$(echo "$line" | awk '{print $1}')
+        store "audio.${idx}.device" "$dev"
+        store "audio.${idx}.pci" "$pci"
+        ((idx++)) || true
+      fi
+    done < <(lspci 2>/dev/null || true)
+  fi
+  store "audio.count" "$idx"
+  store "audio.alsa_info" "$(safe_read /proc/asound/version 2>/dev/null | head -1)"
+}
+
+# -- USB --
+collect_usb() {
+  if has_cmd lsusb; then
+    local idx=0
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^Bus ]]; then
+        local bus dev id desc
+        bus=$(echo "$line" | awk '{print $2}')
+        dev=$(echo "$line" | awk '{print $4}' | tr -d ':')
+        id=$(echo "$line" | awk '{print $6}')
+        desc=$(echo "$line" | sed 's/.*://; s/^[[:space:]]*//')
+        store "usb.${idx}.bus" "$bus"
+        store "usb.${idx}.device" "$dev"
+        store "usb.${idx}.id" "$id"
+        store "usb.${idx}.description" "$desc"
+        ((idx++)) || true
+      fi
+    done < <(lsusb 2>/dev/null || true)
+    store "usb.count" "$idx"
+  fi
+}
+
+# -- PCI --
+collect_pci() {
+  if has_cmd lspci; then
+    local idx=0
+    while IFS= read -r line; do
+      local slot desc
+      slot=$(echo "$line" | awk '{print $1}')
+      desc=$(echo "$line" | sed 's/^[^ ]* //; s/ (.*//')
+      store "pci.${idx}.slot" "$slot"
+      store "pci.${idx}.description" "$desc"
+      ((idx++)) || true
+    done < <(lspci 2>/dev/null || true)
+    store "pci.count" "$idx"
+  fi
 }
 
 # ── CPU usage (needs brief sleep) ──────────────
@@ -520,10 +621,72 @@ render_bios() {
   section_end
 }
 
+render_network() {
+  local c=$(get net.count)
+  section "Network"
+  for ((i=0; i<c; i++)); do
+    local n=$(get net.${i}.name) a=$(get net.${i}.address) s=$(get net.${i}.state) sp=$(get net.${i}.speed)
+    local sc=$D; [[ "$s" == "up" ]] && sc=$G
+    kv "Interface $((i+1))" "$n"
+    kv "  MAC" "$a" "$D"
+    kv "  State" "$s" "$sc"
+    [[ -n "$sp" && "$sp" -gt 0 ]] && kv "  Speed" "${sp} Mbps"
+    local rx=$(get net.${i}.rx_bytes) tx=$(get net.${i}.tx_bytes)
+    [[ -n "$rx" ]] && kv "  RX" "$(fmt_size_bytes "$rx")" && kv "  TX" "$(fmt_size_bytes "$tx")"
+  done
+  local gw=$(get net.default_gateway); [[ -n "$gw" ]] && kv "Gateway" "$gw"
+  section_end
+}
+
+render_audio() {
+  local c=$(get audio.count)
+  [[ "$c" -eq 0 ]] && return
+  section "Audio"
+  for ((i=0; i<c; i++)); do
+    kv "Device $((i+1))" "$(get audio.${i}.device)"
+    kv "  PCI" "$(get audio.${i}.pci)" "$D"
+  done
+  local alsa=$(get audio.alsa_info)
+  [[ -n "$alsa" ]] && kv "ALSA" "$alsa" "$D"
+  section_end
+}
+
+render_usb() {
+  local c=$(get usb.count)
+  section "USB"
+  if [[ "$c" -gt 0 ]]; then
+    kv "Devices" "$c"
+    for ((i=0; i<c && i<8; i++)); do
+      kv "  $((i+1))" "$(get usb.${i}.description) ($(get usb.${i}.id))" "$D"
+    done
+    (( c > 8 )) && kv "  ..." "${D}and $((c-8)) more${NC}" "$D"
+  else
+    kv "Devices" "${D}N/A${NC}" "$D"
+  fi
+  section_end
+}
+
+render_pci() {
+  local c=$(get pci.count)
+  section "PCI Devices"
+  if [[ "$c" -gt 0 ]]; then
+    local shown=0
+    for ((i=0; i<c && shown<12; i++)); do
+      local desc=$(get pci.${i}.description)
+      if echo "$desc" | grep -qiE "VGA|3D|Audio|Net|USB|SATA|NVMe|AHCI|Ethernet|WiFi|Bluetooth|Display"; then
+        kv "$(get pci.${i}.slot)" "$desc" "$D"; ((shown++)) || true
+      fi
+    done
+    (( c > shown )) && kv "  ..." "${D}and $((c-shown)) more${NC}" "$D"
+  fi
+  section_end
+}
+
 render_all() {
   render_machine; render_os; render_kernel; render_cpu; render_memory; render_uptime
   render_gpu; render_storage; render_battery; render_fans; render_temps
   render_displays; render_motherboard; render_bios
+  render_network; render_audio; render_usb; render_pci
 }
 
 # ── Main CLI ────────────────────────────────────
@@ -536,7 +699,7 @@ ${BOLD}Usage:${NC}  ${B}syslens${NC} [command] [options]
 
 ${BOLD}Commands:${NC}
   ${G}syslens${NC}           Show all system information
-  ${G}syslens <section>${NC} Show section: cpu memory os kernel machine uptime gpu storage battery fans temps displays motherboard bios
+  ${G}syslens <section>${NC} Show section: cpu memory os kernel machine uptime gpu storage battery fans temps displays motherboard bios network audio usb pci
   ${G}syslens doctor${NC}    Run health diagnostics
   ${G}syslens help${NC}      Show this help
 
@@ -566,7 +729,7 @@ main() {
   if [[ -n "$cmd" ]]; then
     case "$cmd" in
       doctor|watch|snapshot) echo "Coming in next commit."; return ;;
-      machine|cpu|memory|os|kernel|uptime|gpu|storage|battery|fans|temps|displays|motherboard|bios)
+      machine|cpu|memory|os|kernel|uptime|gpu|storage|battery|fans|temps|displays|motherboard|bios|network|audio|usb|pci)
         collect_all; "render_$cmd"; return ;;
       *) echo "Unknown: $cmd"; usage ;;
     esac
