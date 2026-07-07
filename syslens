@@ -126,8 +126,213 @@ collect_uptime() {
   fi
 }
 
+# -- GPU --
+collect_gpu() {
+  local idx=0
+  if has_cmd lspci; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ VGA|3D|Display ]]; then
+        local dev ven rev
+        dev=$(echo "$line" | sed -n 's/^[^"]*"\([^"]*\)".*/\1/p')
+        ven=$(echo "$line" | sed -n 's/^[^"]*"[^"]*"[[:space:]]*"\([^"]*\)".*/\1/p')
+        rev=$(echo "$line" | sed -n 's/.*(rev \([^)]*\)).*/\1/p')
+        store "gpu.${idx}.device" "$dev"
+        store "gpu.${idx}.vendor" "$ven"
+        store "gpu.${idx}.revision" "$rev"
+        ((idx++)) || true
+      fi
+    done < <(lspci -mm 2>/dev/null || true)
+  fi
+  store "gpu.count" "$idx"
+}
+
+# -- Storage --
+collect_storage() {
+  local idx=0
+  if has_cmd lsblk; then
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      local name size type
+      name=$(echo "$line" | awk '{print $1}')
+      size=$(echo "$line" | awk '{print $2}')
+      type=$(echo "$line" | awk '{print $3}')
+      [[ "$type" != "disk" ]] && continue
+      local model
+      model=$(lsblk -dln -o MODEL "/dev/$name" 2>/dev/null | head -1)
+      model="${model:- }"
+      store "storage.${idx}.name" "$name"
+      store "storage.${idx}.size" "$size"
+      store "storage.${idx}.model" "$model"
+      ((idx++)) || true
+    done < <(lsblk -dln -o NAME,SIZE,TYPE 2>/dev/null)
+    store "storage.count" "$idx"
+  fi
+  # Filesystem usage
+  local fidx=0
+  while IFS= read -r line; do
+    local fs size used avail use mount
+    fs=$(echo "$line" | awk '{print $1}')
+    size=$(echo "$line" | awk '{print $2}')
+    used=$(echo "$line" | awk '{print $3}')
+    avail=$(echo "$line" | awk '{print $4}')
+    use=$(echo "$line" | awk '{print $5}' | tr -d '%')
+    mount=$(echo "$line" | awk '{print $6}')
+    [[ "$fs" == "Filesystem" ]] && continue
+    [[ "$fs" == "tmpfs" || "$fs" == "devtmpfs" || "$fs" == "efivarfs" ]] && continue
+    store "fs.${fidx}.filesystem" "$fs"
+    store "fs.${fidx}.size" "$size"
+    store "fs.${fidx}.used" "$used"
+    store "fs.${fidx}.avail" "$avail"
+    store "fs.${fidx}.use_pct" "$use"
+    store "fs.${fidx}.mount" "$mount"
+    ((fidx++)) || true
+  done < <(df -h 2>/dev/null | tail -n +2)
+  store "fs.count" "$fidx"
+}
+
+# -- Battery --
+collect_battery() {
+  local bidx=0
+  for bat in /sys/class/power_supply/BAT[0-9]*; do
+    [[ -d "$bat" ]] || continue
+    local name="${bat##*/}"
+    store "battery.${bidx}.name" "$name"
+    store "battery.${bidx}.status" "$(safe_read_line "$bat/status")"
+    local cap
+    cap=$(safe_read_line "$bat/capacity")
+    store "battery.${bidx}.capacity" "$cap"
+    local energy_full energy_now voltage_now
+    energy_full=$(safe_read_line "$bat/energy_full" 2>/dev/null || echo "0")
+    energy_now=$(safe_read_line "$bat/energy_now" 2>/dev/null || echo "0")
+    voltage_now=$(safe_read_line "$bat/voltage_now" 2>/dev/null || echo "0")
+    store "battery.${bidx}.energy_full" "$energy_full"
+    store "battery.${bidx}.energy_now" "$energy_now"
+    store "battery.${bidx}.voltage" "$voltage_now"
+    store "battery.${bidx}.technology" "$(safe_read_line "$bat/technology")"
+    store "battery.${bidx}.model" "$(safe_read_line "$bat/model_name")"
+    store "battery.${bidx}.manufacturer" "$(safe_read_line "$bat/manufacturer")"
+    ((bidx++)) || true
+  done
+  store "battery.count" "$bidx"
+}
+
+# -- Fans --
+collect_fans() {
+  local fidx=0
+  if has_cmd sensors; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ ([0-9]+)\ RPM ]]; then
+        local rpm="${BASH_REMATCH[1]}"
+        local label=""
+        [[ "$line" =~ ^([^:]+): ]] && label="${BASH_REMATCH[1]}"
+        store "fan.${fidx}.name" "$label"
+        store "fan.${fidx}.rpm" "$rpm"
+        ((fidx++)) || true
+      fi
+    done < <(sensors 2>/dev/null || true)
+  fi
+  store "fan.count" "$fidx"
+}
+
+# -- Temperatures --
+collect_temps() {
+  local tidx=0
+  for zone in /sys/class/thermal/thermal_zone[0-9]*; do
+    [[ -d "$zone" ]] || continue
+    local temp type
+    temp=$(safe_read_line "$zone/temp" 2>/dev/null || echo "0")
+    type=$(safe_read_line "$zone/type" 2>/dev/null || echo "unknown")
+    if [[ "$temp" -gt 0 ]]; then
+      local temp_c
+      temp_c=$(bc -l <<< "$temp / 1000" 2>/dev/null || echo "0")
+      store "temp.${tidx}.name" "$type"
+      store "temp.${tidx}.celsius" "$(printf "%.1f" "$temp_c")"
+      ((tidx++)) || true
+    fi
+  done
+  store "temp.count" "$tidx"
+}
+
+# -- Displays --
+collect_displays() {
+  local idx=0
+  if has_cmd xrandr && [[ -n "${DISPLAY:-}" ]]; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^([a-zA-Z0-9_-]+)\ connected ]]; then
+        local display_name="${BASH_REMATCH[1]}"
+        store "display.${idx}.name" "$display_name"
+        if [[ "$line" =~ ([0-9]+)x([0-9]+)\+([0-9]+)\+([0-9]+) ]]; then
+          store "display.${idx}.width" "${BASH_REMATCH[1]}"
+          store "display.${idx}.height" "${BASH_REMATCH[2]}"
+        fi
+        if [[ "$line" =~ ([0-9.]+)mm\ x\ ([0-9.]+)mm ]]; then
+          store "display.${idx}.width_mm" "${BASH_REMATCH[1]}"
+          store "display.${idx}.height_mm" "${BASH_REMATCH[2]}"
+        fi
+        ((idx++)) || true
+      fi
+    done < <(xrandr --current 2>/dev/null || true)
+  fi
+  store "display.count" "$idx"
+  for bl in /sys/class/backlight/*/brightness; do
+    [[ -r "$bl" ]] || continue
+    store "display.backlight" "$(safe_read_line "$bl")"
+    store "display.max_backlight" "$(safe_read_line "${bl%/*}/max_brightness")"
+  done
+}
+
+# -- Motherboard --
+collect_motherboard() {
+  if [[ -d /sys/devices/virtual/dmi/id ]]; then
+    store "board.vendor" "$(safe_read_line /sys/devices/virtual/dmi/id/board_vendor)"
+    store "board.name" "$(safe_read_line /sys/devices/virtual/dmi/id/board_name)"
+    store "board.version" "$(safe_read_line /sys/devices/virtual/dmi/id/board_version)"
+    store "board.serial" "$(safe_read_line /sys/devices/virtual/dmi/id/board_serial)"
+  fi
+}
+
+# -- BIOS --
+collect_bios() {
+  if [[ -d /sys/devices/virtual/dmi/id ]]; then
+    store "bios.vendor" "$(safe_read_line /sys/devices/virtual/dmi/id/bios_vendor)"
+    store "bios.version" "$(safe_read_line /sys/devices/virtual/dmi/id/bios_version)"
+    store "bios.date" "$(safe_read_line /sys/devices/virtual/dmi/id/bios_date)"
+    store "bios.release" "$(safe_read_line /sys/devices/virtual/dmi/id/bios_release)"
+    store "bios.ec_firmware" "$(safe_read_line /sys/devices/virtual/dmi/id/ec_firmware_release)"
+  fi
+  if [[ -d /sys/firmware/efi ]]; then
+    store "bios.mode" "UEFI"
+  else
+    store "bios.mode" "Legacy BIOS"
+  fi
+}
+
 collect_all() {
   collect_machine; collect_cpu; collect_memory; collect_os; collect_kernel; collect_uptime
+  collect_gpu; collect_storage; collect_battery; collect_fans; collect_temps
+  collect_displays; collect_motherboard; collect_bios
+}
+
+# ── CPU usage (needs brief sleep) ──────────────
+
+collect_cpu_usage() {
+  local stat prev_idle prev_total
+  stat=$(safe_read /proc/stat | head -1) || true
+  local user nice sys idle iowait irq softirq steal
+  read -r _ user nice sys idle iowait irq softirq steal <<< "$stat"
+  prev_total=$((user + nice + sys + idle + iowait + irq + softirq + steal))
+  prev_idle=$((idle + iowait))
+  sleep 0.3
+  stat=$(safe_read /proc/stat | head -1) || true
+  read -r _ user nice sys idle iowait irq softirq steal <<< "$stat"
+  local total=$((user + nice + sys + idle + iowait + irq + softirq + steal))
+  local idl=$((idle + iowait))
+  local total_d=$((total - prev_total))
+  local idle_d=$((idl - prev_idle))
+  if (( total_d > 0 )); then
+    local usage=$(( 100 * (total_d - idle_d) / total_d ))
+    store "cpu.usage_percent" "$usage"
+  fi
 }
 
 # ── Terminal output ─────────────────────────────
@@ -199,7 +404,127 @@ render_uptime() {
   section_end
 }
 
-render_all() { render_machine; render_os; render_kernel; render_cpu; render_memory; render_uptime; }
+render_gpu() {
+  local c=$(get gpu.count)
+  section "GPU"
+  if [[ "$c" -gt 0 ]]; then
+    for ((i=0; i<c; i++)); do
+      kv "Device $((i+1))" "$(get gpu.${i}.device)"
+      kv "  Vendor" "$(get gpu.${i}.vendor)" "$D"
+    done
+  else
+    kv "GPU" "${D}N/A${NC}" "$D"
+  fi
+  section_end
+}
+
+render_storage() {
+  local c=$(get storage.count)
+  section "Storage"
+  if [[ "$c" -gt 0 ]]; then
+    for ((i=0; i<c; i++)); do
+      kv "Disk $((i+1))" "/dev/$(get storage.${i}.name)"
+      kv "  Size" "$(get storage.${i}.size)"
+      local m=$(get storage.${i}.model); m="${m%% }"
+      [[ -n "$m" ]] && kv "  Model" "$m" "$D"
+    done
+  fi
+  local fc=$(get fs.count)
+  if [[ "$fc" -gt 0 ]]; then
+    printf "${D}${V_LINE}  %-20s %8s %8s %8s %5s${NC}\n" "Mount" "Size" "Used" "Avail" "Use%"
+    for ((i=0; i<fc; i++)); do
+      local m=$(get fs.${i}.mount) s=$(get fs.${i}.size) u=$(get fs.${i}.used)
+      local a=$(get fs.${i}.avail) p=$(get fs.${i}.use_pct)
+      local col=$NC; [[ -n "$p" ]] && (( p > 90 )) && col=$R; [[ -n "$p" ]] && (( p > 75 && p <= 90 )) && col=$Y
+      printf "${D}${V_LINE}${NC}  %-20s %8s %8s %8s ${col}%3s%%${NC}\n" "$m" "$s" "$u" "$a" "$p"
+    done
+  fi
+  section_end
+}
+
+render_battery() {
+  local c=$(get battery.count)
+  [[ "$c" -eq 0 ]] && return
+  section "Battery"
+  for ((i=0; i<c; i++)); do
+    kv "Name" "$(get battery.${i}.name)"
+    kv "  Status" "$(get battery.${i}.status)"
+    local cap=$(get battery.${i}.capacity)
+    local cap_col=$G; [[ -n "$cap" ]] && (( cap < 20 )) && cap_col=$R
+    [[ -n "$cap" ]] && (( cap >= 20 && cap < 50 )) && cap_col=$Y
+    [[ -n "$cap" ]] && kv "  Capacity" "${cap}%" "$cap_col"
+    kv "  Technology" "$(get battery.${i}.technology)" "$D"
+    kv "  Model" "$(get battery.${i}.model)" "$D"
+    kv "  Manufacturer" "$(get battery.${i}.manufacturer)" "$D"
+  done
+  section_end
+}
+
+render_fans() {
+  local c=$(get fan.count)
+  [[ "$c" -eq 0 ]] && return
+  section "Fans"
+  for ((i=0; i<c; i++)); do
+    local n=$(get fan.${i}.name); [[ -z "$n" ]] && n="Fan $((i+1))"
+    kv "$n" "$(get fan.${i}.rpm) RPM"
+  done
+  section_end
+}
+
+render_temps() {
+  local c=$(get temp.count)
+  [[ "$c" -eq 0 ]] && return
+  section "Temperatures"
+  for ((i=0; i<c; i++)); do
+    local cel=$(get temp.${i}.celsius) cint=${cel%.*}
+    local col=$G; (( cint >= 80 )) && col=$R; (( cint >= 60 && cint < 80 )) && col=$Y
+    kv "$(get temp.${i}.name)" "${cel}°C" "$col"
+  done
+  section_end
+}
+
+render_displays() {
+  local c=$(get display.count)
+  section "Displays"
+  if [[ "$c" -gt 0 ]]; then
+    for ((i=0; i<c; i++)); do
+      local n=$(get display.${i}.name) w=$(get display.${i}.width) h=$(get display.${i}.height)
+      [[ -n "$w" ]] && kv "Display $((i+1))" "${n}  ${w}x${h}" || kv "Display $((i+1))" "$n"
+    done
+  else
+    kv "Displays" "${D}N/A${NC}" "$D"
+  fi
+  local bl=$(get display.backlight) mbl=$(get display.max_backlight)
+  [[ -n "$bl" && "$mbl" -gt 0 ]] && kv "Brightness" "$((bl * 100 / mbl))%"
+  section_end
+}
+
+render_motherboard() {
+  local v=$(get board.vendor) n=$(get board.name)
+  [[ -z "$v" && -z "$n" ]] && return
+  section "Motherboard"
+  kv "Vendor" "$v"
+  kv "Model" "$n"
+  kv "Version" "$(get board.version)"
+  section_end
+}
+
+render_bios() {
+  local v=$(get bios.vendor)
+  [[ -z "$v" ]] && return
+  section "BIOS"
+  kv "Vendor" "$v"
+  kv "Version" "$(get bios.version)"
+  kv "Date" "$(get bios.date)"
+  kv "Mode" "$(get bios.mode)"
+  section_end
+}
+
+render_all() {
+  render_machine; render_os; render_kernel; render_cpu; render_memory; render_uptime
+  render_gpu; render_storage; render_battery; render_fans; render_temps
+  render_displays; render_motherboard; render_bios
+}
 
 # ── Main CLI ────────────────────────────────────
 
@@ -211,7 +536,7 @@ ${BOLD}Usage:${NC}  ${B}syslens${NC} [command] [options]
 
 ${BOLD}Commands:${NC}
   ${G}syslens${NC}           Show all system information
-  ${G}syslens <section>${NC} Show section: cpu memory os kernel machine uptime
+  ${G}syslens <section>${NC} Show section: cpu memory os kernel machine uptime gpu storage battery fans temps displays motherboard bios
   ${G}syslens doctor${NC}    Run health diagnostics
   ${G}syslens help${NC}      Show this help
 
@@ -241,7 +566,7 @@ main() {
   if [[ -n "$cmd" ]]; then
     case "$cmd" in
       doctor|watch|snapshot) echo "Coming in next commit."; return ;;
-      machine|cpu|memory|os|kernel|uptime)
+      machine|cpu|memory|os|kernel|uptime|gpu|storage|battery|fans|temps|displays|motherboard|bios)
         collect_all; "render_$cmd"; return ;;
       *) echo "Unknown: $cmd"; usage ;;
     esac
