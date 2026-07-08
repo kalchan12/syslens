@@ -2116,8 +2116,6 @@ cmd_watch() {
     printf "${BOLD}${C}syslens${NC} ${D}watch • %s${NC}\n" "$date_str"
     printf "${D}%s${NC}\n" "$(printf "%0.s─" $(seq 1 62))"
 
-    unset SYS
-    declare -gA SYS
     collect_all_with_usage
 
     # Render compact view
@@ -2365,9 +2363,8 @@ cmd_menu() {
         render_all
         printf "\n  ${D}Press Enter to continue...${NC}" && read -r
         ;;
-      3)
-        collect_all_with_usage
-        cmd_doctor
+       3)
+         cmd_doctor
         printf "\n  ${D}Press Enter to continue...${NC}" && read -r
         ;;
       4)
@@ -2414,6 +2411,7 @@ cmd_menu() {
 
 cmd_menu_sections() {
   local sec
+  collect_all
   while true; do
     printf "\033[H\033[J"
     printf "${BOLD}${C}┌──────────────────────── Sections ─────────────────────────┐${NC}\n"
@@ -2440,7 +2438,6 @@ cmd_menu_sections() {
         )
         local idx=$((sec-1))
         [[ "$idx" -ge 0 && "$idx" -lt "${#names[@]}" ]] || { printf "\n  ${R}Invalid.${NC} ${D}Press Enter...${NC}" && read -r; continue; }
-        collect_all
         local sname="${names[$idx]}"
         [[ "$sname" == "cpu" ]] && collect_cpu_usage
         [[ "$sname" == "virt" ]] && sname="virtualization"
