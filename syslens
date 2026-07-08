@@ -272,11 +272,11 @@ collect_cpu() {
   fi
 
   # Load averages
-  local loadavg
-  loadavg=$(< /proc/loadavg) 2>/dev/null || true
-  store "cpu.load_1m" "$(echo "${loadavg:-}" | awk '{print $1}')"
-  store "cpu.load_5m" "$(echo "${loadavg:-}" | awk '{print $2}')"
-  store "cpu.load_15m" "$(echo "${loadavg:-}" | awk '{print $3}')"
+  local l1 l5 l15
+  IFS=' ' read -r l1 l5 l15 _ < /proc/loadavg 2>/dev/null || true
+  store "cpu.load_1m" "${l1:-0}"
+  store "cpu.load_5m" "${l5:-0}"
+  store "cpu.load_15m" "${l15:-0}"
 }
 
 collect_cpu_usage() {
@@ -367,14 +367,9 @@ collect_memory() {
 collect_storage() {
   local idx=0
   if has_cmd lsblk; then
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      local name size type mount
-      name=$(echo "$line" | awk '{print $1}')
-      size=$(echo "$line" | awk '{print $2}')
-      type=$(echo "$line" | awk '{print $3}')
+    while IFS=' ' read -r name size type mount _; do
+      [[ -z "$name" ]] && continue
       [[ "$type" != "disk" ]] && continue
-      mount=$(echo "$line" | awk '{print $4}')
       local model
       model=$(lsblk -dln -o MODEL "/dev/$name" 2>/dev/null | head -1)
       model="${model:- }"
@@ -388,16 +383,9 @@ collect_storage() {
 
   # Filesystem usage from df
   local fidx=0
-  while IFS= read -r line; do
-    local fs size used avail use mount target
-    fs=$(echo "$line" | awk '{print $1}')
-    size=$(echo "$line" | awk '{print $2}')
-    used=$(echo "$line" | awk '{print $3}')
-    avail=$(echo "$line" | awk '{print $4}')
-    use=$(echo "$line" | awk '{print $5}' | tr -d '%')
-    mount=$(echo "$line" | awk '{print $6}')
-    [[ "$fs" == "Filesystem" ]] && continue
-    [[ "$fs" == "tmpfs" || "$fs" == "devtmpfs" || "$fs" == "efivarfs" ]] && continue
+  while IFS=' ' read -r fs size used avail use_pct mount _; do
+    use="${use_pct%\%}"
+    [[ "$fs" == "Filesystem" || "$fs" == "tmpfs" || "$fs" == "devtmpfs" || "$fs" == "efivarfs" ]] && continue
     [[ -z "$mount" ]] && continue
     store "fs.${fidx}.filesystem" "$fs"
     store "fs.${fidx}.size" "$size"
@@ -709,21 +697,16 @@ collect_audio() {
 collect_usb() {
   if has_cmd lsusb; then
     local idx=0
-    while IFS= read -r line; do
-      if [[ "$line" =~ ^Bus ]]; then
-        local bus dev id vendor product
-        bus=$(echo "$line" | awk '{print $2}')
-        dev=$(echo "$line" | awk '{print $4}' | tr -d ':')
-        id=$(echo "$line" | awk '{print $6}')
-        # Extract vendor:product names
-        local desc
-        desc=$(echo "$line" | sed 's/.*://; s/^[[:space:]]*//')
-        store "usb.${idx}.bus" "$bus"
-        store "usb.${idx}.device" "$dev"
-        store "usb.${idx}.id" "$id"
-        store "usb.${idx}.description" "$desc"
-        ((idx++)) || true
-      fi
+    while IFS= read -r _ bus _ dev_raw _ id rest; do
+      [[ "$bus" == "Device" ]] && continue
+      local dev="${dev_raw%:}"
+      local desc="${rest#*:  }"
+      [[ -z "$desc" ]] && desc="$rest"
+      store "usb.${idx}.bus" "$bus"
+      store "usb.${idx}.device" "$dev"
+      store "usb.${idx}.id" "$id"
+      store "usb.${idx}.description" "$desc"
+      ((idx++)) || true
     done < <(lsusb 2>/dev/null || true)
     store "usb.count" "$idx"
   fi
