@@ -161,6 +161,30 @@ usage_bar() {
   echo "$bar"
 }
 
+# Colorize a usage percentage (0-100)
+usage_color() {
+  local p=$1
+  (( p > 90 )) && { echo "$R"; return; }
+  (( p > 75 )) && { echo "$Y"; return; }
+  echo "$G"
+}
+
+# Colorize a temperature in Celsius
+temp_color() {
+  local t=$1
+  (( t >= 80 )) && { echo "$R"; return; }
+  (( t >= 60 )) && { echo "$Y"; return; }
+  echo "$G"
+}
+
+# Colorize CPU usage percent
+cpu_usage_color() {
+  local u=$1
+  (( u > 80 )) && { echo "$R"; return; }
+  (( u >= 50 )) && { echo "$Y"; return; }
+  echo "$G"
+}
+
 # ──────────────────────────────────────────────
 #  DATA STORE
 # ──────────────────────────────────────────────
@@ -1041,13 +1065,7 @@ render_cpu() {
   checked_kv "Flags" "$(get cpu.flags)" "$D"
   local usage=$(get cpu.usage_percent)
   if [[ -n "$usage" ]]; then
-    if (( usage > 80 )); then
-      kv "Usage" "${usage}%" "$R"
-    elif (( usage > 50 )); then
-      kv "Usage" "${usage}%" "$Y"
-    else
-      kv "Usage" "${usage}%" "$G"
-    fi
+    kv "Usage" "${usage}%" "$(cpu_usage_color "$usage")"
   fi
   kv "Load (1/5/15m)" "$(get cpu.load_1m) / $(get cpu.load_5m) / $(get cpu.load_15m)"
   checked_kv "Cache" "$(get cpu.cache)"
@@ -1107,23 +1125,11 @@ render_memory() {
 
   # Memory bar
   if [[ "$total" -gt 0 ]]; then
-    local bar_len=30
-    local filled=$(( pct * bar_len / 100 ))
-    local empty=$(( bar_len - filled ))
-    local bar=""
-    bar+="["
-    if (( pct > 80 )); then
-      bar+="${R}"
-    elif (( pct > 50 )); then
-      bar+="${Y}"
-    else
-      bar+="${G}"
-    fi
-    for ((i=0; i<filled; i++)); do bar+="█"; done
-    bar+="${D}"
-    for ((i=0; i<empty; i++)); do bar+="░"; done
-    bar+="${NC}] ${pct}%"
-    kv "Usage" "$bar"
+    local bar_color=$G
+    (( pct > 80 )) && bar_color=$R
+    (( pct > 50 && pct <= 80 )) && bar_color=$Y
+    local bar=$(usage_bar "$pct" "$bar_color" 30)
+    kv "Usage" "${bar} ${pct}%"
   fi
 
   local swap_total=$(get memory.swap_total_kb)
@@ -1167,9 +1173,7 @@ render_storage() {
       local avail=$(get "fs.${i}.avail")
       local use_pct=$(get "fs.${i}.use_pct")
       local col=$NC
-      if [[ -n "$use_pct" && "$use_pct" -gt 90 ]]; then col=$R
-      elif [[ -n "$use_pct" && "$use_pct" -gt 75 ]]; then col=$Y
-      fi
+      [[ -n "$use_pct" ]] && col=$(usage_color "$use_pct")
       printf "${D}${V_LINE}${NC}  %-20s %8s %8s %8s ${col}%3s%%${NC}\n" "$mount" "$size" "$used" "$avail" "$use_pct"
     done
   fi
@@ -1227,8 +1231,7 @@ render_temps() {
     local col=$G
     if [[ -n "$celsius" ]]; then
       local cint=${celsius%.*}
-      (( cint >= 80 )) && col=$R
-      (( cint >= 60 && cint < 80 )) && col=$Y
+      col=$(temp_color "$cint")
     fi
     kv "$name" "${celsius}°C" "$col"
   done
@@ -2140,17 +2143,10 @@ render_memory_compact() {
   local used_mib=$((total_mib - avail_mib))
   local pct=$(( (total_mib - avail_mib) * 100 / total_mib ))
 
-  local bar_len=25
-  local filled=$(( pct * bar_len / 100 ))
-  local bar="["
   local col=$G
   (( pct > 80 )) && col=$R
   (( pct >= 50 && pct <= 80 )) && col=$Y
-  bar+="$col"
-  for ((i=0; i<filled; i++)); do bar+="█"; done
-  bar+="$D"
-  for ((i=0; i<bar_len-filled; i++)); do bar+="░"; done
-  bar+="$NC]"
+  local bar=$(usage_bar "$pct" "$col" 25)
   printf "${B}MEM:${NC} %s %s/%s MiB (%d%%)\n" "$bar" "$used_mib" "$total_mib" "$pct"
 }
 
@@ -2162,9 +2158,7 @@ render_storage_compact() {
     local mount=$(get "fs.${i}.mount")
     local use_pct=$(get "fs.${i}.use_pct")
     [[ "$mount" == "/" || "$mount" == "/home" || "$mount" == "/boot" ]] || continue
-    local col=$G
-    (( use_pct > 90 )) && col=$R
-    (( use_pct >= 75 && use_pct <= 90 )) && col=$Y
+    local col=$(usage_color "$use_pct")
     printf "${col}%s %s%%${NC}  " "$mount" "$use_pct"
     ((shown++)) || true
   done
@@ -2180,9 +2174,7 @@ render_temps_compact() {
     local name=$(get "temp.${i}.name")
     local celsius=$(get "temp.${i}.celsius")
     local cint=${celsius%.*}
-    local col=$G
-    (( cint >= 80 )) && col=$R
-    (( cint >= 60 && cint < 80 )) && col=$Y
+    local col=$(temp_color "$cint")
     # Show only relevant sensors
     if echo "$name" | grep -qiE "cpu|core|package|pch|soc|gpu"; then
       printf "${col}%s %s°C${NC}  " "$name" "$celsius"
@@ -2269,7 +2261,7 @@ render_minimal() {
   kv "  Load" "${l1} / ${l5} / ${l15} (1/5/15m)"
   local u=$(get cpu.usage_percent)
   if [[ -n "$u" ]]; then
-    local uc=$G; (( u > 80 )) && uc=$R; (( u >= 50 && u <= 80 )) && uc=$Y
+    local uc=$(cpu_usage_color "$u")
     kv "  Usage" "${uc}${u}%${NC}"
   fi
   local tk="${SYS[memory.total_kb]:-0}" ak="${SYS[memory.avail_kb]:-0}"
@@ -2278,7 +2270,10 @@ render_minimal() {
   local um=$((tm-am))
   local pm=0
   (( tm > 0 )) && pm=$(( (tm-am)*100/tm ))
-  local bar=$(usage_bar "$pm" "$G" 30)
+  local mc=$G
+  (( pm > 80 )) && mc=$R
+  (( pm > 50 && pm <= 80 )) && mc=$Y
+  local bar=$(usage_bar "$pm" "$mc" 30)
   kv "Memory" "${um} / ${tm} MiB used"
   kv "  Usage" "${bar} ${pm}%"
   local s=$(get storage.count)
@@ -2301,7 +2296,7 @@ render_minimal() {
   for ((i=0; i<fc; i++)); do
     local m=$(get fs.${i}.mount) p=$(get fs.${i}.use_pct)
     local sz=$(get fs.${i}.size) used=$(get fs.${i}.used) avail=$(get fs.${i}.avail)
-    local pc=$G; (( p > 90 )) && pc=$R; (( p >= 75 && p <= 90 )) && pc=$Y
+    local pc=$(usage_color "$p")
     local bar=$(usage_bar "$p" "$pc" 30)
     kv "  ${m}" "${used} / ${sz} used"
     kv "    Usage" "${bar} ${p}%"
