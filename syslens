@@ -18,6 +18,7 @@
 #   syslens help               Show this help message
 
 set -uo pipefail
+shopt -s nullglob
 IFS=$'\n\t'
 
 # ──────────────────────────────────────────────
@@ -947,17 +948,25 @@ collect_uptime() {
 
 # -- Processes --
 collect_processes() {
-  local total running sleeping zombie stopped
+  local total running=0 sleeping=0 zombie=0 stopped=0 state
+
+  # Single ps call, count states via awk
   total=$(ps -e 2>/dev/null | wc -l) || total=0
   if [[ -z "$total" || "$total" -eq 0 ]]; then
-    total=$(ls /proc/[0-9]* 2>/dev/null | wc -l) || total=0
+    # fallback: count /proc entries (nullglob protects against no matches)
+    local procs=(/proc/[0-9]*)
+    total=${#procs[@]}
   fi
   store "process.total" "$((total - 1))"
 
-  running=$(ps -e -o state= 2>/dev/null | grep -c "^R") || running=0
-  sleeping=$(ps -e -o state= 2>/dev/null | grep -c "^S") || sleeping=0
-  zombie=$(ps -e -o state= 2>/dev/null | grep -c "^Z") || zombie=0
-  stopped=$(ps -e -o state= 2>/dev/null | grep -c "^T") || stopped=0
+  while IFS= read -r state; do
+    case "$state" in
+      R) ((running++)) ;;
+      S) ((sleeping++)) ;;
+      Z) ((zombie++)) ;;
+      T) ((stopped++)) ;;
+    esac
+  done < <(ps -e -o state= 2>/dev/null || true)
 
   store "process.running" "$running"
   store "process.sleeping" "$sleeping"
@@ -1565,7 +1574,7 @@ print(json.dumps(data, indent=2))
       keys+=("$key")
     done
     # Sort keys
-    IFS=$'\n' keys=($(sort <<<"${keys[*]}")); unset IFS
+    IFS=$'\n' keys=($(sort <<<"${keys[*]}")); IFS=$'\n\t'
     local first=true
     for key in "${keys[@]}"; do
       $first || printf ",\n"
