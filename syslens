@@ -147,6 +147,21 @@ checked_kv() {
   fi
 }
 
+# Draw a usage bar: [████░░░] 53%
+# Args: percent color width
+usage_bar() {
+  local p=$1 c=$2 w=$3
+  local fill=$((p * w / 100))
+  (( fill > w )) && fill=$w
+  local bar="[${c}"
+  local i
+  for ((i=0; i<fill; i++)); do bar+="█"; done
+  bar+="${D}"
+  for ((i=0; i<w-fill; i++)); do bar+="░"; done
+  bar+="${NC}]"
+  echo "$bar"
+}
+
 # ──────────────────────────────────────────────
 #  DATA STORE
 # ──────────────────────────────────────────────
@@ -2327,10 +2342,7 @@ render_minimal() {
   local um=$((tm-am))
   local pm=0
   (( tm > 0 )) && pm=$(( (tm-am)*100/tm ))
-  local bl=30
-  local fl=$((pm*bl/100))
-  local bar="[${G}"; for ((i=0;i<fl;i++)); do bar+="█"; done
-  bar+="${D}"; for ((i=0;i<bl-fl;i++)); do bar+="░"; done; bar+="${NC}]"
+  local bar=$(usage_bar "$pm" "$G" 30)
   kv "Memory" "${um} / ${tm} MiB used"
   kv "  Usage" "${bar} ${pm}%"
   local s=$(get storage.count)
@@ -2343,9 +2355,12 @@ render_minimal() {
   local fc=$(get fs.count)
   for ((i=0; i<fc; i++)); do
     local m=$(get fs.${i}.mount) p=$(get fs.${i}.use_pct)
+    local sz=$(get fs.${i}.size) used=$(get fs.${i}.used) avail=$(get fs.${i}.avail)
     [[ "$m" != "/" && "$m" != "/home" && "$m" != "/boot" ]] && continue
     local pc=$G; (( p > 90 )) && pc=$R; (( p >= 75 && p <= 90 )) && pc=$Y
-    kv "  ${m}" "${pc}${p}% used${NC}"
+    local bar=$(usage_bar "$p" "$pc" 30)
+    kv "  ${m}" "${used} / ${sz} used"
+    kv "    Usage" "${bar} ${p}%"
   done
   kv "Uptime" "$(get uptime.display)" "$C"
   kv "Processes" "$(get process.total) total, $(get process.running) running"
