@@ -27,7 +27,6 @@ IFS=$'\n\t'
 VERSION="0.1.0"
 SNAPSHOT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/syslens/snapshots"
 export LC_ALL=C
-SELF="$0"
 
 # ──────────────────────────────────────────────
 #  COLOR / FORMATTING
@@ -173,24 +172,6 @@ declare -A SYS=()
 
 store() { SYS["$1"]="$2"; }
 get() { echo "${SYS[$1]-}"; }
-store_arr() {
-  local base="$1" count_key="${base}.count"
-  local idx=0
-  SYS["$count_key"]=$#
-  shift
-  for val in "$@"; do
-    SYS["${base}.${idx}"]="$val"
-    ((idx++)) || true
-  done
-}
-get_arr() {
-  local base="$1" count_key="${base}.count"
-  local count="${SYS[$count_key]:-0}"
-  for ((i=0; i<count; i++)); do
-    echo "${SYS[${base}.${i}]-}"
-  done
-}
-
 # ──────────────────────────────────────────────
 #  COLLECTORS
 # ──────────────────────────────────────────────
@@ -1567,33 +1548,6 @@ render_all() {
 # ──────────────────────────────────────────────
 
 # Collect all keys into a JSON-compatible structure
-to_json() {
-  local indent="${1:-2}"
-  python3 -c "
-import json, sys, os
-data = {}
-keys = sorted(os.environ.keys())
-for k in keys:
-    if k.startswith('SYS_'):
-        parts = k[4:].split('__')
-        d = data
-        for p in parts[:-1]:
-            d = d.setdefault(p, {})
-        d[parts[-1]] = os.environ[k]
-print(json.dumps(data, indent=$indent))
-" 2>/dev/null || {
-    # Fallback: simple manual JSON using awk
-    printf "{\n"
-    local first=true
-    for key in "${!SYS[@]}"; do
-      $first || printf ",\n"
-      first=false
-      printf "  \"%s\": \"%s\"" "$key" "${SYS[$key]}"
-    done
-    printf "\n}\n"
-  }
-}
-
 export_json() {
   # Build JSON directly without env var roundtrip
   python3 -c "
