@@ -2349,14 +2349,22 @@ render_minimal() {
   if [[ "$s" -gt 0 ]]; then
     for ((i=0; i<s; i++)); do
       local dn=$(get storage.${i}.name) ds=$(get storage.${i}.size)
-      kv "Disk $((i+1))" "/dev/${dn}  (${ds})" "$D"
+      kv "Disk $((i+1))" "/dev/${dn}  (${ds})" "$C"
+      while IFS= read -r line; do
+        local pname psize pmount
+        pname=$(echo "$line" | awk '{print $1}')
+        psize=$(echo "$line" | awk '{print $2}')
+        pmount=$(echo "$line" | awk '{print $4}')
+        pname="${pname#${dn}}"
+        [[ -z "$pname" ]] && continue
+        kv "  Partition ${pname}" "${psize}  ${pmount:-unmounted}" "$D"
+      done < <(lsblk -ln -o NAME,SIZE,TYPE,MOUNTPOINT "/dev/$dn" 2>/dev/null | grep "part")
     done
   fi
   local fc=$(get fs.count)
   for ((i=0; i<fc; i++)); do
     local m=$(get fs.${i}.mount) p=$(get fs.${i}.use_pct)
     local sz=$(get fs.${i}.size) used=$(get fs.${i}.used) avail=$(get fs.${i}.avail)
-    [[ "$m" != "/" && "$m" != "/home" && "$m" != "/boot" ]] && continue
     local pc=$G; (( p > 90 )) && pc=$R; (( p >= 75 && p <= 90 )) && pc=$Y
     local bar=$(usage_bar "$p" "$pc" 30)
     kv "  ${m}" "${used} / ${sz} used"
