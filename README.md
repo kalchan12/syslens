@@ -2,7 +2,7 @@
 
 **Linux System Inspection & Diagnostics Tool**
 
-A fast, modular, cross-distribution system inspector that gathers comprehensive hardware, operating system, and runtime information. Reads from `/proc`, `/sys`, and kernel interfaces before falling back to external utilities.
+A fast, modular, cross-distribution system inspector. Uses a Rust binary (`syslens-rust`) to read `/proc`, `/sys`, and kernel interfaces directly — no external utilities required for the heavy collectors. Falls back to pure bash when the binary isn't available.
 
 ## Features
 
@@ -34,7 +34,7 @@ A fast, modular, cross-distribution system inspector that gathers comprehensive 
 
 - **`syslens doctor`** — Health diagnostics checking memory, CPU load, temperatures, battery, swap, disk usage, zombie processes, uptime, and ASLR
 - **`syslens watch`** — Live compact monitoring with auto-refresh
-- **`syslens snapshot save|list|diff`** — System state snapshots for tracking changes over time
+- **`syslens snapshot save\|list\|diff`** — System state snapshots for tracking changes over time
 
 ### Export Formats
 
@@ -45,20 +45,37 @@ A fast, modular, cross-distribution system inspector that gathers comprehensive 
 
 ## Installation
 
+### One-liner (recommended)
+
+```bash
+curl -sfL https://raw.githubusercontent.com/kalchan12/syslens/main/install.sh | bash
+```
+
+Requires `git` and `cargo` to build the Rust binary. If Rust isn't available, it installs the bash script only — fully functional but slower on some collectors.
+
+### From source
+
 ```bash
 git clone https://github.com/kalchan12/syslens.git
 cd syslens
-chmod +x syslens
-./syslens
+make install
+```
 
-# Optional: add to PATH
-sudo ln -s "$PWD/syslens" /usr/local/bin/
+### Manual
+
+```bash
+git clone https://github.com/kalchan12/syslens.git
+cd syslens
+cd syslens-collect && cargo build --release && cp target/release/syslens-collect ../syslens-rust && cd ..
+sudo cp syslens syslens-rust /usr/local/bin/
 ```
 
 ## Usage
 
 ```
-syslens                    Show all system information
+syslens                    Interactive menu
+syslens minimal            Quick system overview
+syslens full               All system information
 syslens cpu                Show a specific section
 syslens doctor             Run health diagnostics
 syslens watch 5            Live monitoring (5s interval)
@@ -71,30 +88,33 @@ syslens snapshot diff      Compare with latest snapshot
 
 `machine` `cpu` `memory` `storage` `gpu` `battery` `fans` `temps` `displays` `motherboard` `bios` `network` `audio` `usb` `pci` `os` `kernel` `security` `virt` `uptime` `processes`
 
-## Design
+## How it works
 
-syslens is built as a single bash script with:
+Two components working together:
 
-- **Independent collectors** — each system aspect has a dedicated function storing results in a flat key-value store
-- **Separate renderers** — terminal output uses Unicode box drawing and ANSI colors; export functions handle structured formats
-- **Graceful degradation** — missing permissions or hardware never crashes; falls back from kernel interfaces to external commands
-- **Cross-distribution** — avoids distribution-specific assumptions; tested on Debian/Ubuntu/Mint/Fedora/Arch
+- **`syslens-rust`** — reads system data directly from `/proc`, `/sys`, and kernel interfaces. Zero external crate dependencies (only `libc` for `statvfs`). Collects:
+  - CPU usage (30ms sampling vs 300ms in bash)
+  - Processes via `/proc/[0-9]*/stat` (no `ps` subprocess)
+  - Storage via `/sys/block/*` + `statvfs` (no `lsblk`/`df`)
+  - Temperature zones and hwmon sensors (no `sensors`)
+  - Fan RPM from hwmon sysfs
+  - USB devices from `/sys/bus/usb/devices` (no `lsusb`)
+  - PCI devices with vendor/device name lookup from `pci.ids` (no `lspci`)
+  - `all` subcommand runs every collector in a single invocation
+
+- **`syslens`** — bash script handling orchestration, display rendering (Unicode box drawing, ANSI colors), interactive menus, export formats, health diagnostics, and system snapshots. When `syslens-rust` is found, it delegates collection to the binary. Otherwise, every collector falls back to pure bash reading `/proc` and `/sys` directly or (as last resort) calling external utilities.
 
 ## Requirements
 
-| Utility | Purpose | Fallback |
-|---|---|---|
-| `/proc`, `/sys` | Primary data sources | — |
-| `lscpu` | CPU details | `/proc/cpuinfo` |
-| `lsblk` | Block devices | — |
-| `lspci` | PCI/GPU devices | — |
-| `lsusb` | USB devices | — |
-| `sensors` | Fans, temperatures | `/sys/class/thermal`, `/sys/class/hwmon` |
-| `xrandr` | Display info | `/sys/class/drm` |
-| `python3` | JSON/YAML export | Fallback to manual JSON |
+- `/proc` and `/sys` (kernel interfaces, always available on Linux)
+- `cargo` (only to build the Rust binary — optional)
+- `python3` (only for structured export — optional, falls back to manual JSON)
 
-Optional: `dmidecode` (extra DMI data), `PyYAML` (YAML export), `bc` (floating point math).
+The Rust binary replaces `lspci`, `lsusb`, `lsblk`, `df`, `ps`, `lscpu`, `sensors`, and `bc` — none of these are needed at runtime when `syslens-rust` is installed.
 
-## License
+## Design
 
-MIT
+- **Independent collectors** — each system aspect collects into a flat key-value store; renderers and exporters only read from the store
+- **Separate rendering** — terminal output, JSON, YAML, Markdown, and HTML are independent modules layered on the same data
+- **Graceful degradation** — missing permissions, hardware, or the Rust binary never crashes; falls back through bash to direct sysfs reads to external commands
+- **Cross-distribution** — no distribution-specific assumptions; avoids package-manager dependencies
