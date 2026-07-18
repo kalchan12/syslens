@@ -1073,25 +1073,32 @@ collect_all() {
   collect_machine
   collect_cpu
   collect_memory
-  collect_storage
-  collect_pci
+
+  # Single Rust call covers storage, temps, fans, usb, pci, processes
+  if ! rust_collect all; then
+    collect_storage
+    collect_fans
+    collect_temps
+    collect_usb
+    collect_pci
+    collect_processes
+    collect_system_load
+  fi
+
+  # These use stored PCI data (populated by Rust 'all' or by collect_pci)
   collect_gpu
   collect_audio
+
   collect_battery
-  collect_fans
-  collect_temps
   collect_displays
   collect_motherboard
   collect_bios
   collect_network
-  collect_usb
   collect_os
   collect_kernel
   collect_security
   collect_virtualization
   collect_uptime
-  collect_processes
-  collect_system_load
 }
 
 # collect_cpu_usage adds ~300ms delay from sampling.

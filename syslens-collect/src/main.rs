@@ -1,3 +1,4 @@
+mod all;
 mod cpu;
 mod fans;
 mod pci;
@@ -11,6 +12,7 @@ fn main() {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
 
     let result = match cmd {
+        "all" => all::collect(),
         "cpu-usage" => cpu::collect(),
         "temps" => temps::collect(),
         "processes" => process::collect(),
@@ -21,7 +23,8 @@ fn main() {
         "help" => {
             eprintln!("Usage: syslens-collect <command>");
             eprintln!("Commands:");
-            eprintln!("  cpu-usage    CPU usage percentage");
+            eprintln!("  all          All static collectors (storage, temps, fans, usb, pci, processes)");
+            eprintln!("  cpu-usage    CPU usage percentage (sampling, not in 'all')");
             eprintln!("  temps        Temperature sensors");
             eprintln!("  processes    Process counts and top consumers");
             eprintln!("  storage      Disk and filesystem information");
