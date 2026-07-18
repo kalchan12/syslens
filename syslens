@@ -197,6 +197,28 @@ declare -A SYS=()
 
 store() { SYS["$1"]="$2"; }
 get() { echo "${SYS[$1]-}"; }
+
+# Run a syslens-collect subcommand and store results
+rust_collect() {
+  local subcmd=$1
+  [[ -z "$subcmd" ]] && return 1
+  local rust_bin=""
+  if has_cmd syslens-rust; then
+    rust_bin="syslens-rust"
+  else
+    local dir="${BASH_SOURCE[0]%/*}"
+    [[ "$dir" == "${BASH_SOURCE[0]}" ]] && dir="."
+    if [[ -x "$dir/syslens-rust" ]]; then
+      rust_bin="$dir/syslens-rust"
+    else
+      return 1
+    fi
+  fi
+  while IFS='=' read -r key val; do
+    [[ -n "$key" ]] && store "$key" "$val"
+  done < <("$rust_bin" "$subcmd" 2>/dev/null)
+  return 0
+}
 # ──────────────────────────────────────────────
 #  COLLECTORS
 # ──────────────────────────────────────────────
@@ -305,6 +327,7 @@ collect_cpu() {
 }
 
 collect_cpu_usage() {
+  rust_collect cpu-usage && return
   local stat prev_idle prev_total
   stat=$(safe_read /proc/stat | head -1) || true
   local user nice sys idle iowait irq softirq steal
@@ -508,6 +531,7 @@ collect_fans() {
 
 # -- Temperatures --
 collect_temps() {
+  rust_collect temps && return
   local tidx=0
   # From thermal zones
   for zone in /sys/class/thermal/thermal_zone[0-9]*; do
@@ -948,6 +972,7 @@ collect_uptime() {
 
 # -- Processes --
 collect_processes() {
+  rust_collect processes && return
   local total running=0 sleeping=0 zombie=0 stopped=0 state
 
   # Single ps call, count states via awk
