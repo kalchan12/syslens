@@ -357,20 +357,31 @@ cache_lspci() {
 
 # -- GPU --
 collect_gpu() {
-  cache_lspci
   local idx=0
-  if [[ -n "$LSPCI_MM_CACHED" ]]; then
-    while IFS= read -r line; do
-      [[ "$line" =~ VGA|3D|Display ]] || continue
-      local dev ven rev
-      dev=$(echo "$line" | sed -n 's/^[^"]*"\([^"]*\)".*/\1/p')
-      ven=$(echo "$line" | sed -n 's/^[^"]*"[^"]*"[[:space:]]*"\([^"]*\)".*/\1/p')
-      rev=$(echo "$line" | sed -n 's/.*(rev \([^)]*\)).*/\1/p')
-      store "gpu.${idx}.device" "$dev"
-      store "gpu.${idx}.vendor" "$ven"
-      store "gpu.${idx}.revision" "$rev"
+  local pc=$(get pci.count)
+  if [[ -n "$pc" && "$pc" -gt 0 ]]; then
+    for ((i=0; i<pc; i++)); do
+      local desc=$(get "pci.${i}.description")
+      [[ "$desc" =~ VGA|3D|Display ]] || continue
+      store "gpu.${idx}.device" "$desc"
       ((idx++)) || true
-    done <<< "$LSPCI_MM_CACHED"
+    done
+  fi
+  if [[ "$idx" -eq 0 ]]; then
+    cache_lspci
+    if [[ -n "$LSPCI_MM_CACHED" ]]; then
+      while IFS= read -r line; do
+        [[ "$line" =~ VGA|3D|Display ]] || continue
+        local dev ven rev
+        dev=$(echo "$line" | sed -n 's/^[^"]*"\([^"]*\)".*/\1/p')
+        ven=$(echo "$line" | sed -n 's/^[^"]*"[^"]*"[[:space:]]*"\([^"]*\)".*/\1/p')
+        rev=$(echo "$line" | sed -n 's/.*(rev \([^)]*\)).*/\1/p')
+        store "gpu.${idx}.device" "$dev"
+        store "gpu.${idx}.vendor" "$ven"
+        store "gpu.${idx}.revision" "$rev"
+        ((idx++)) || true
+      done <<< "$LSPCI_MM_CACHED"
+    fi
   fi
   store "gpu.count" "$idx"
   if [[ -d /sys/class/drm ]]; then
@@ -413,6 +424,7 @@ collect_memory() {
 
 # -- Storage --
 collect_storage() {
+  rust_collect storage && return
   local idx=0
   if has_cmd lsblk; then
     while IFS=' ' read -r name size type mount _; do
@@ -491,6 +503,7 @@ collect_battery() {
 
 # -- Fans --
 collect_fans() {
+  rust_collect fans && return
   local fidx=0
   if has_cmd sensors; then
     while IFS= read -r line; do
@@ -705,17 +718,30 @@ collect_network() {
 
 # -- Audio --
 collect_audio() {
-  cache_lspci
   local idx=0
-  if [[ -n "$LSPCI_CACHED" ]]; then
-    while IFS= read -r line; do
-      [[ "$line" =~ Audio|HDMI|HDA|AC97 ]] || continue
-      local dev
-      dev=$(echo "$line" | sed 's/.*: //; s/ (.*//')
-      store "audio.${idx}.device" "$dev"
-      store "audio.${idx}.pci" "$(echo "$line" | awk '{print $1}')"
+  local pc=$(get pci.count)
+  if [[ -n "$pc" && "$pc" -gt 0 ]]; then
+    for ((i=0; i<pc; i++)); do
+      local desc=$(get "pci.${i}.description")
+      local slot=$(get "pci.${i}.slot")
+      [[ "$desc" =~ Audio|HDMI|HDA|AC97 ]] || continue
+      store "audio.${idx}.device" "$desc"
+      store "audio.${idx}.pci" "$slot"
       ((idx++)) || true
-    done <<< "$LSPCI_CACHED"
+    done
+  fi
+  if [[ "$idx" -eq 0 ]]; then
+    cache_lspci
+    if [[ -n "$LSPCI_CACHED" ]]; then
+      while IFS= read -r line; do
+        [[ "$line" =~ Audio|HDMI|HDA|AC97 ]] || continue
+        local dev
+        dev=$(echo "$line" | sed 's/.*: //; s/ (.*//')
+        store "audio.${idx}.device" "$dev"
+        store "audio.${idx}.pci" "$(echo "$line" | awk '{print $1}')"
+        ((idx++)) || true
+      done <<< "$LSPCI_CACHED"
+    fi
   fi
   store "audio.count" "$idx"
 
@@ -744,6 +770,7 @@ collect_audio() {
 
 # -- USB --
 collect_usb() {
+  rust_collect usb && return
   if has_cmd lsusb; then
     local idx=0
     while IFS= read -r _ bus _ dev_raw _ id rest; do
@@ -763,6 +790,7 @@ collect_usb() {
 
 # -- PCI --
 collect_pci() {
+  rust_collect pci && return
   cache_lspci
   local idx=0
   if [[ -n "$LSPCI_CACHED" ]]; then
@@ -1046,7 +1074,9 @@ collect_all() {
   collect_cpu
   collect_memory
   collect_storage
+  collect_pci
   collect_gpu
+  collect_audio
   collect_battery
   collect_fans
   collect_temps
@@ -1054,9 +1084,7 @@ collect_all() {
   collect_motherboard
   collect_bios
   collect_network
-  collect_audio
   collect_usb
-  collect_pci
   collect_os
   collect_kernel
   collect_security
@@ -2315,15 +2343,15 @@ render_minimal() {
     for ((i=0; i<s; i++)); do
       local dn=$(get storage.${i}.name) ds=$(get storage.${i}.size)
       kv "Disk $((i+1))" "/dev/${dn}  (${ds})" "$C"
-      while IFS= read -r line; do
-        local pname psize pmount
-        pname=$(echo "$line" | awk '{print $1}')
-        psize=$(echo "$line" | awk '{print $2}')
-        pmount=$(echo "$line" | awk '{print $4}')
-        pname="${pname#${dn}}"
-        [[ -z "$pname" ]] && continue
-        kv "  Partition ${pname}" "${psize}  ${pmount:-unmounted}" "$D"
-      done < <(lsblk -ln -o NAME,SIZE,TYPE,MOUNTPOINT "/dev/$dn" 2>/dev/null | grep "part")
+      local pc=$(get "storage.${i}.partition_count")
+      for ((j=0; j<pc; j++)); do
+        local pn=$(get "storage.${i}.partition.${j}.name")
+        local ps=$(get "storage.${i}.partition.${j}.size")
+        local pm=$(get "storage.${i}.partition.${j}.mount")
+        [[ -z "$pn" ]] && continue
+        pn="${pn#${dn}}"
+        kv "  Partition ${pn}" "${ps}  ${pm:-unmounted}" "$D"
+      done
     done
   fi
   local fc=$(get fs.count)
